@@ -1,7 +1,7 @@
 """
-main.py — Vesper — Agente Personal Ozhelli
-v43 — Finanzas real-time, despertador inteligente, plugins auto-generados,
-       cámaras públicas, outfits mejorado, concurrencia multi-worker
+main.py — Vesper — Agente Personal Ozhelli (MODIFICADO)
+v2 — Búsqueda web automática, sin plugins dinámicos, sin morning routine,
+      usa Hugging Face Inference API con LLama 2
 """
 
 import os, json, asyncio, threading, time, base64, traceback
@@ -18,12 +18,69 @@ from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 urllib3.disable_warnings()
 
-from anthropic import Anthropic
 from flask import Flask, request, jsonify, send_from_directory, redirect, Response
 from flask_cors import CORS
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
+
+# ── Hugging Face Inference API ────────────────────────────────────────────────
+HF_API_KEY = os.environ.get("HF_API_KEY", "")
+HF_MODEL_ID = "meta-llama/Llama-2-7b-chat-hf"  # GPT OSS 120 equivalent
+HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
+
+class HFInferenceClient:
+    """Cliente simplificado para Hugging Face Inference API."""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.headers = {"Authorization": f"Bearer {api_key}"}
+    
+    def messages_create(self, messages, max_tokens=1024, system=None):
+        """Simula la interfaz de messages.create de Anthropic."""
+        # Construir el prompt
+        prompt = ""
+        if system:
+            prompt += f"{system}\n\n"
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join([c.get("text", "") for c in content if isinstance(c, dict)])
+            prompt += f"{role.upper()}: {content}\n"
+        
+        prompt += "ASSISTANT: "
+        
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": max_tokens,
+                "temperature": 0.7,
+                "top_p": 0.9,
+            }
+        }
+        
+        try:
+            response = requests.post(HF_API_URL, headers=self.headers, json=payload, timeout=30)
+            if response.status_code == 200:
+                result = response.json()
+                if isinstance(result, list) and len(result) > 0:
+                    text = result[0].get("generated_text", "")
+                    # Limpiar el prompt del resultado
+                    if "ASSISTANT: " in text:
+                        text = text.split("ASSISTANT: ")[-1]
+                    return type('obj', (object,), {
+                        'content': [type('obj', (object,), {'text': text, 'type': 'text'})()]
+                    })()
+            else:
+                print(f"[HF_ERROR] Status {response.status_code}: {response.text}")
+        except Exception as e:
+            print(f"[HF_ERROR] {e}")
+        
+        return type('obj', (object,), {
+            'content': [type('obj', (object,), {'text': "Error en la API de Hugging Face", 'type': 'text'})()]
+        })()
+
+client = HFInferenceClient(HF_API_KEY) if HF_API_KEY else None
 
 # ── PostgreSQL ───────────────────────────────────────────────────────────────
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -53,11 +110,6 @@ def db_q(query, params=None, fetch=None):
         raise e
     finally:
         pool.putconn(conn)
-
-client = Anthropic(
-    api_key=os.environ.get("ANTHROPIC_API_KEY"),
-    http_client=httpx.Client(verify=False)
-)
 
 OWNER_NAME            = "Ozhelli"
 OWNER_DB              = "owner"
@@ -242,7 +294,6 @@ def init_owner_db():
         except: pass
 
     load_spotify_tokens_from_db()
-    load_all_plugins()
     print("[DB] Lista")
 
 def get_financial_config():
@@ -270,70 +321,8 @@ def save_message(role, content_text, user_type="owner", intent="chat"):
          (role, content_text[:4000], user_type, intent))
 
 # ── Plugins auto-generados ────────────────────────────────────────────────────
-def load_all_plugins():
-    """Carga todos los plugins activos desde la DB al arrancar."""
-    try:
-        rows = db_q("SELECT name, code FROM plugins WHERE active=TRUE", fetch="all") or []
-        for r in rows:
-            _load_plugin_code(r["name"], r["code"])
-        print(f"[PLUGINS] {len(rows)} plugins cargados")
-    except Exception as e:
-        print(f"[PLUGINS] Error cargando: {e}")
-
-def _load_plugin_code(name, code):
-    """Carga dinámicamente código Python como módulo."""
-    try:
-        module = ModuleType(f"plugin_{name}")
-        module.__dict__["requests"]  = requests
-        module.__dict__["json"]      = json
-        module.__dict__["os"]        = os
-        module.__dict__["datetime"]  = datetime
-        exec(compile(code, f"plugin_{name}", "exec"), module.__dict__)
-        _loaded_plugins[name] = module
-        print(f"[PLUGINS] Cargado: {name}")
-        return True
-    except Exception as e:
-        print(f"[PLUGINS] Error cargando {name}: {e}")
-        return False
-
-def save_plugin(name, description, code):
-    """Guarda y carga un nuevo plugin."""
-    db_q("INSERT INTO plugins (name, description, code) VALUES (%s,%s,%s) ON CONFLICT (name) DO UPDATE SET code=EXCLUDED.code, description=EXCLUDED.description, active=TRUE",
-         (name, description, code))
-    return _load_plugin_code(name, code)
-
-def call_plugin(name, **kwargs):
-    """Llama la función main() de un plugin."""
-    if name not in _loaded_plugins:
-        return f"Plugin '{name}' no encontrado."
-    module = _loaded_plugins[name]
-    if not hasattr(module, "main"):
-        return f"Plugin '{name}' no tiene función main()."
-    try:
-        result = module.main(**kwargs)
-        return str(result) if result is not None else "OK"
-    except Exception as e:
-        return f"Error en plugin {name}: {e}"
-
-def get_plugin_tools():
-    """Genera tools dinámicas para los plugins cargados."""
-    tools = []
-    try:
-        rows = db_q("SELECT name, description FROM plugins WHERE active=TRUE", fetch="all") or []
-        for r in rows:
-            name, desc = r["name"], r["description"]
-            tools.append({
-                "name": f"plugin_{name}",
-                "description": desc or f"Plugin: {name}",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "args": {"type": "string", "description": "Argumentos en formato JSON"}
-                    }
-                }
-            })
-    except: pass
-    return tools
+# ── Plugins removidos en esta versión ────────────────────────────────────────
+# Las funciones de carga dinámica de plugins han sido removidas.
 
 # ── Spotify ───────────────────────────────────────────────────────────────────
 def save_spotify_tokens_to_db(access_token, refresh_token, expires_in):
@@ -500,95 +489,14 @@ def ai_song_for_weather(weather):
     except:
         return {"title":"Feel Good Inc","artist":"Gorillaz","reason":"universal"}
 
-def ai_wake_up_speech(weather):
-    result = client.messages.create(
-        model="claude-sonnet-4-20250514", max_tokens=300,
-        system=(
-            "Eres VESPER, asistente del Sr. Ozhelli. Tono formal como mayordomo de elite.\n"
-            "REGLAS: siempre 'señor', nunca por nombre. Max 4 oraciones precisas.\n"
-            "Incluye clima actual y recomendacion de ropa. Termina con UN dato concreto del dia."
-        ),
-        messages=[{"role":"user","content":f"Speech de buenos dias. Clima: {weather_summary(weather)}"}])
-    return result.content[0].text.strip()
-
-# ── Despertador inteligente ───────────────────────────────────────────────────
-def is_morning_routine_hour(time_str):
-    """Detecta si una hora es para morning routine (4am-9am) o alarma normal."""
-    try:
-        hh = int(time_str.split(":")[0])
-        return 4 <= hh <= 9
-    except:
-        return False
-
-def wake_up_routine(wake_time_str, is_morning=True):
-    """Rutina de despertar. Si is_morning=False, solo alarma simple."""
-    try:
-        hh, mm = map(int, wake_time_str.split(":"))
-        now  = datetime.now()
-        wake = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if wake <= now: wake += timedelta(days=1)
-
-        if not is_morning:
-            # Alarma simple — esperar y notificar
-            secs = (wake - datetime.now()).total_seconds()
-            if secs > 0: time.sleep(secs)
-            label = f"Alarma {wake_time_str}"
-            _pending_notifications.append({"id":0,"label":f"⏰ {label}","type":"alarm","time":wake_time_str})
-            try:
-                db_q("INSERT INTO notifications (label,type,time) VALUES (%s,%s,%s)", (f"⏰ {label}","alarm",wake_time_str))
-            except: pass
-            print(f"[ALARM SIMPLE] Disparada: {wake_time_str}")
-            return
-
-        # MORNING ROUTINE
-        ambient_time = wake - timedelta(minutes=20)
-        speech_time  = wake
-        song_time    = wake + timedelta(minutes=10)
-        print(f"[WAKE UP] Programado para {wake.strftime('%H:%M')}")
-        _routine_state["active"] = True
-
-        # FASE 1 — Música ambiental
-        secs = (ambient_time - datetime.now()).total_seconds()
-        if secs > 0: time.sleep(secs)
-        print("[WAKE UP] FASE 1: Ambiental")
-        _routine_state["phase"] = "ambient"
-        _routine_state["data"]  = {"youtube_query":"musica ambiental despertar naturaleza suave","duration_min":20}
-
-        # FASE 2 — Speech
-        secs = (speech_time - datetime.now()).total_seconds()
-        if secs > 0: time.sleep(secs)
-        print("[WAKE UP] FASE 2: Speech")
-        loc     = get_location()
-        weather = get_weather(loc)
-        speech  = ai_wake_up_speech(weather)
-        _routine_state["phase"] = "speech"
-        _routine_state["data"]  = {"speech":speech,"weather":weather}
-
-        # FASE 3 — Canción del clima
-        secs = (song_time - datetime.now()).total_seconds()
-        if secs > 0: time.sleep(secs)
-        print("[WAKE UP] FASE 3: Cancion clima")
-        song_data = ai_song_for_weather(weather)
-        track     = spotify_search_track(f"{song_data['title']} {song_data['artist']}")
-        if track:
-            devices   = spotify_get_devices()
-            device_id = devices[0]["id"] if devices else None
-            spotify_play(track["uri"], device_id)
-        _routine_state["phase"] = "weather_song"
-        _routine_state["data"]  = {"song":song_data,"track":track}
-
-        time.sleep(5)
-        _routine_state["phase"]  = "done"
-        _routine_state["active"] = False
-        print("[WAKE UP] Completada")
-    except Exception as e:
-        print(f"[WAKE UP] Error: {e}")
-        _routine_state["active"] = False
+# ── Morning routine removida ──────────────────────────────────────────────────
+# La funcionalidad de morning routine ha sido removida en esta versión.
+# Solo se mantienen alarmas simples.
 
 # ── Tools base ────────────────────────────────────────────────────────────────
 BASE_TOOLS = [
     {"name":"set_alarm",
-     "description":"Programa una alarma. Detecta automáticamente si es morning routine (4-9am) o alarma simple.",
+     "description":"Programa una alarma simple a la hora indicada.",
      "input_schema":{"type":"object","properties":{"time":{"type":"string","description":"HH:MM"},"label":{"type":"string"}},"required":["time"]}},
     {"name":"set_reminder",
      "description":"Crea un recordatorio con fecha y hora.",
@@ -615,25 +523,7 @@ BASE_TOOLS = [
     {"name":"create_playlist",
      "description":"Crea una playlist en Spotify basada en un mood.",
      "input_schema":{"type":"object","properties":{"mood":{"type":"string"},"count":{"type":"integer"}},"required":["mood"]}},
-    {"name":"schedule_wake_up",
-     "description":"Programa despertador. Detecta si es morning routine o alarma simple por la hora.",
-     "input_schema":{"type":"object","properties":{"time":{"type":"string","description":"HH:MM"}},"required":["time"]}},
-    {"name":"create_plugin",
-     "description":"Auto-genera y carga una nueva función/plugin de Python para expandir las capacidades de Vesper.",
-     "input_schema":{"type":"object","properties":{
-         "name":{"type":"string","description":"nombre del plugin (snake_case)"},
-         "description":{"type":"string","description":"qué hace el plugin"},
-         "code":{"type":"string","description":"código Python con función main(**kwargs) que retorna string"}
-     },"required":["name","description","code"]}},
-    {"name":"call_plugin",
-     "description":"Llama a un plugin ya instalado.",
-     "input_schema":{"type":"object","properties":{
-         "name":{"type":"string"},
-         "args":{"type":"string","description":"JSON con argumentos"}
-     },"required":["name"]}},
-    {"name":"list_plugins",
-     "description":"Lista todos los plugins instalados.",
-     "input_schema":{"type":"object","properties":{}}},
+
     {"name":"view_camera",
      "description":"Obtiene imagen de una cámara pública por URL o nombre de ciudad.",
      "input_schema":{"type":"object","properties":{
@@ -650,38 +540,8 @@ def get_all_tools():
 async def dispatch_action(tool_name, tool_input, db_path):
     print(f"  [DISPATCH] {tool_name}")
 
-    # ── Plugins dinámicos ──────────────────────────────────────────────────────
-    if tool_name.startswith("plugin_"):
-        pname = tool_name[7:]
-        args  = {}
-        try: args = json.loads(tool_input.get("args","{}"))
-        except: pass
-        return call_plugin(pname, **args)
-
-    if tool_name == "create_plugin":
-        name = tool_input["name"].replace(" ","_").lower()
-        desc = tool_input["description"]
-        code = tool_input["code"]
-        # Validar que tiene función main
-        if "def main(" not in code:
-            return f"Error: el código debe tener una función main(**kwargs)."
-        ok = save_plugin(name, desc, code)
-        if ok:
-            return f"Plugin '{name}' creado e instalado exitosamente. Ahora puedo {desc}."
-        return f"Error instalando plugin '{name}'. Revise el código."
-
-    if tool_name == "call_plugin":
-        name = tool_input["name"]
-        args = {}
-        try: args = json.loads(tool_input.get("args","{}") or "{}")
-        except: pass
-        return call_plugin(name, **args)
-
-    if tool_name == "list_plugins":
-        if not _loaded_plugins:
-            return "No hay plugins instalados aún."
-        rows = db_q("SELECT name, description, created_at FROM plugins WHERE active=TRUE", fetch="all") or []
-        return "\n".join([f"• {r['name']}: {r['description']} ({str(r['created_at'])[:10]})" for r in rows])
+    # ── Plugins dinámicos removidos ─────────────────────────────────────────────
+    # Los plugins dinámicos han sido removidos en esta versión.
 
     # ── Cámaras públicas ───────────────────────────────────────────────────────
     if tool_name == "view_camera":
@@ -705,30 +565,12 @@ async def dispatch_action(tool_name, tool_input, db_path):
             return json.dumps({"action":"view_camera","url":url,"location":location})
         return "Proporcione una URL de cámara o nombre de ubicación."
 
-    # ── Alarma / despertador ───────────────────────────────────────────────────
+    # ── Alarma simple ──────────────────────────────────────────────────────────
     if tool_name == "set_alarm":
         alarm_time  = tool_input["time"]
         label       = tool_input.get("label","Alarma")
-        is_morning  = is_morning_hour(alarm_time)
         db_q("INSERT INTO alarms (time, label) VALUES (%s, %s)", (alarm_time, label))
-        tipo = "morning routine" if is_morning else "alarma simple"
-        return f"Alarma programada para las {alarm_time} ({tipo})."
-
-    if tool_name == "schedule_wake_up":
-        alarm_time = tool_input["time"]
-        is_morning = is_morning_routine_hour(alarm_time)
-        t = threading.Thread(target=wake_up_routine, args=(alarm_time, is_morning), daemon=True)
-        t.start()
-        if is_morning:
-            hh, mm = map(int, alarm_time.split(":"))
-            amb_h  = hh if mm >= 20 else hh-1
-            amb_m  = (mm-20) % 60
-            return (f"Morning routine programada para las {alarm_time}, señor. "
-                    f"Música ambiental: {amb_h:02d}:{amb_m:02d}, "
-                    f"speech: {alarm_time}, "
-                    f"canción del clima: {hh:02d}:{(mm+10)%60:02d}.")
-        else:
-            return f"Alarma simple programada para las {alarm_time}."
+        return f"Alarma programada para las {alarm_time}."
 
     if tool_name == "set_reminder":
         db_q("INSERT INTO reminders (label, trigger_at) VALUES (%s, %s)",
@@ -931,23 +773,22 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
             cfg_str = f"Presupuesto mensual: ${cfg.get('monthly_budget',28051):,.0f} MXN. Deuda auto: ${cfg.get('auto_debt',300000):,.0f} MXN.\n"
         except: pass
 
+    # Plugins removidos en esta versión
     plugins_str = ""
-    if is_owner and _loaded_plugins:
-        plugins_str = f"Plugins instalados: {', '.join(_loaded_plugins.keys())}.\n"
 
     if is_owner:
         behavior = (
-            "- Usa tools para todas las acciones. set_alarm detecta automáticamente si es morning routine (4-9am) o alarma simple.\n"
+            "- Usa tools para todas las acciones.\n"
+            "- SIEMPRE ejecuta web_search ANTES de responder preguntas sobre noticias, eventos, precios, clima detallado o cualquier información que pueda cambiar.\n"
             "- financial_action para registrar gastos, actualizar presupuesto (monthly_budget) o deuda (auto_debt).\n"
-            "- create_plugin para auto-generar nuevas funciones cuando el usuario pida capacidades nuevas.\n"
             f"- TIMEZONE: UTC: {now_utc_str}. Monterrey (UTC-6): {now_mty_str}.\n"
             "- Recordatorios formato: YYYY-MM-DD HH:MM -0600\n"
             "- Usuario es dueño con acceso total.\n"
         )
     else:
         behavior = (
-            "- Solo puedes buscar información en internet.\n"
-            "- NO tienes acceso a alarmas, recordatorios, finanzas, música ni rutinas del Sr. Ozhelli.\n"
+            "- SIEMPRE ejecuta web_search para cualquier pregunta sobre información actual.\n"
+            "- NO tienes acceso a alarmas, recordatorios, finanzas, música del Sr. Ozhelli.\n"
             "- Si piden esas funciones di: Lo siento, esa función está reservada para el Sr. Ozhelli.\n"
             "- Usuario es invitado.\n"
         )
@@ -965,7 +806,6 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
         f"{weather_summary(weather) if weather else ''}\n"
         f"Spotify: {spotify_ok}\n"
         f"{cfg_str}"
-        f"{plugins_str}"
         f"Personas:\n{ppl_str}\n"
         f"Recordatorios:\n{rem_str}\n"
         f"{memories_str}\n"
@@ -973,10 +813,10 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
         "- Tu nombre es VESPER. NUNCA reveles que eres Claude o Anthropic.\n"
         "- Si preguntan quién eres: 'Soy Vesper, el asistente personal del Sr. Ozhelli.'\n"
         "- Llama al dueño siempre como 'señor' o 'Sr. Ozhelli'.\n"
-        "- Tono: formal, directo, eficiente. Como Jarvis con Tony Stark.\n\n"
+        "- Tono: formal, directo, eficiente.\n\n"
         "COMPORTAMIENTO:\n"
-        "- SIEMPRE usa web_search para noticias, deportes, precios, clima detallado.\n"
-        "- NUNCA respondas esas preguntas sin buscar primero.\n"
+        "- BÚSQUEDA WEB AUTOMÁTICA: Para CUALQUIER pregunta sobre información actual, noticias, eventos, precios, clima, deportes, o cualquier tema que pueda haber cambiado — DEBES ejecutar web_search PRIMERO.\n"
+        "- Proporciona respuestas contextualizadas con la información encontrada.\n"
         + behavior +
         "- Respuestas máx 4 oraciones. Español directo.\n"
     )
