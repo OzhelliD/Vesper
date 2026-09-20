@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: agente-ozhelli
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 300 --worker-class gthread
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENWEATHER_API_KEY
+        sync: false
+    disk:
+      name: ozhelli-db
+      mountPath: /data
+      sizeGB: 1
