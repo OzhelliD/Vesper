@@ -1,63 +1,95 @@
-# Vesper — despliegue en Render
+# 🤖 Vesper — Agente Personal Inteligente
+## Versión con Arquitectura Interna DIAN
 
-## Arquitectura de producción
+**Vesper** es tu asistente personal IA especializado en finanzas, rutinas, comunicación y análisis en tiempo real.
 
-- Backend: Flask + Gunicorn
-- Runtime: Python 3.11
-- Base de datos: PostgreSQL mediante `DATABASE_URL`
-- Frontend: `static/index.html`
-- Health check: `/api/health`
-- Un solo Gunicorn worker para evitar duplicar schedulers y procesos background
+**v2.0** — Refactorizado con arquitectura interna DIAN (6 capas desacopladas, reglas sin IF anidados)
 
-## Deploy
+---
 
-1. Sube el repositorio a GitHub.
-2. En Render: **New → Blueprint** y selecciona el repositorio.
-3. Render leerá `render.yaml`.
-4. Configura `DATABASE_URL` con tu PostgreSQL.
-5. Configura `ANTHROPIC_API_KEY`.
-6. Añade las integraciones que uses: Spotify, OpenWeather, Tavily, SerpAPI y Pixabay.
-7. Para Spotify, usa como `SPOTIFY_REDIRECT_URI` la URL pública de Render seguida de `/spotify/callback`.
+## 🚀 Características
 
-## Keep-alive
+- **Claude API** como cerebro inteligente
+- **PostgreSQL** en Railway para persistencia
+- **Clima en tiempo real** (OpenWeather)
+- **Spotify integrado** para música
+- **Finanzas tracking** (gastos, presupuesto, deuda)
+- **Plugins auto-generados** con Python
+- **Búsqueda web** (Tavily, SerpAPI)
+- **Sin morning routine** (simplificado)
 
-El proyecto incluye un keep-alive opcional para Render. Está activado en `render.yaml` y consulta `/api/health` cada 14 minutos.
+---
 
-Es una medida experimental y no debe considerarse una garantía contra las políticas de suspensión del proveedor. Se puede desactivar con:
+## 📦 Despliegue en Railway
 
-```text
-ENABLE_KEEP_ALIVE=false
-```
-
-## Variables
-
-Obligatorias:
-
-```text
-DATABASE_URL
-ANTHROPIC_API_KEY
-```
-
-Opcionales:
-
-```text
-OPENWEATHER_API_KEY
-OWNER_PIN
-SPOTIFY_CLIENT_ID
-SPOTIFY_CLIENT_SECRET
-SPOTIFY_REDIRECT_URI
-TAVILY_API_KEY
-SERPAPI_KEY
-PIXABAY_KEY
-```
-
-Render proporciona `PORT` y, cuando está disponible, `RENDER_EXTERNAL_URL`.
-
-## Comprobación local
+### 1. Deploy automático desde GitHub
 
 ```bash
-python -m py_compile main.py
-gunicorn main:app --bind 0.0.0.0:8080 --workers 1 --threads 4 --timeout 300 --worker-class gthread
+git push
+# Railway desplegará automáticamente
 ```
 
-Abre `/api/health` para comprobar que el proceso está vivo.
+### 2. Configurar variables en Railway
+
+```
+DATABASE_URL          → PostgreSQL (Railway proporciona)
+ANTHROPIC_API_KEY     → sk-ant-... (obtener en console.anthropic.com)
+```
+
+### 3. Verificar
+
+```bash
+curl https://tu-app.railway.app/api/health
+```
+
+---
+
+## 🛠️ Local Development
+
+```bash
+# Setup
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# Editar .env
+
+# Run
+python main.py
+# http://localhost:8080
+```
+
+---
+
+## 📋 Variables Requeridas
+
+**Obligatorias:**
+- `DATABASE_URL` → PostgreSQL
+- `ANTHROPIC_API_KEY` → Claude API
+
+**Opcionales:**
+- `OPENWEATHER_API_KEY` → Clima
+- `SPOTIFY_CLIENT_ID/SECRET` → Música
+- `OWNER_PIN` → Seguridad
+
+Ver `.env.example` para más detalles.
+
+---
+
+## ✅ Cambios en v2.0
+
+✅ Morning routine eliminada  
+✅ Arquitectura DIAN interna (6 capas)  
+✅ Reglas sin IF anidados  
+✅ Todos los demás features intactos  
+
+---
+
+## 📞 Documentación
+
+- [Railway Docs](https://docs.railway.app)
+- [Anthropic API](https://docs.anthropic.com)
+- [Flask](https://flask.palletsprojects.com)
+
+---
+
+**Vesper © 2024** | Agente Personal de Ozhelli
