@@ -402,7 +402,7 @@ def spotify_create_playlist(name, track_uris):
 def ai_generate_playlist(mood, count=15):
     safe_count = min(count, 50)
     result = client.messages.create(
-        model="claude-sonnet-4-20250514", max_tokens=1000,
+        model="claude-sonnet-4-5", max_tokens=1000,
         system="Eres un DJ experto. Genera playlists con canciones reales y populares. Responde SOLO JSON valido, sin texto extra, sin backticks.",
         messages=[{"role":"user","content":
             f"Genera exactamente {safe_count} canciones para mood: '{mood}'. "
