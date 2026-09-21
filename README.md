@@ -1,75 +1,95 @@
-# Agente Personal Ozhelli — Render.com
+# 🤖 Vesper — Agente Personal Inteligente
+## Versión con Arquitectura Interna DIAN
 
-## Setup en 5 pasos
+**Vesper** es tu asistente personal IA especializado en finanzas, rutinas, comunicación y análisis en tiempo real.
 
-### 1. Sube el código a GitHub
-Crea un repositorio privado en github.com y sube estos archivos:
-```
-main.py
-requirements.txt
-render.yaml
-static/
-  index.html
-```
-
-### 2. Crea cuenta en Render
-render.com → Sign up (gratis, con GitHub)
-
-### 3. New Web Service
-- Dashboard → New → Web Service
-- Conecta tu repositorio de GitHub
-- Render detecta automáticamente el render.yaml
-
-### 4. Agrega las variables de entorno
-En Render → Environment:
-```
-ANTHROPIC_API_KEY   = sk-ant-...tu-key-nueva...
-OPENWEATHER_API_KEY = (opcional, para clima real)
-```
-
-### 5. Agrega el disco persistente
-En Render → Disks → Add Disk:
-```
-Name:       ozhelli-db
-Mount Path: /data
-Size:       1 GB (gratis en plan Individual)
-```
-
-→ Deploy → en 2-3 minutos tienes tu URL pública
+**v2.0** — Refactorizado con arquitectura interna DIAN (6 capas desacopladas, reglas sin IF anidados)
 
 ---
 
-## Estructura
+## 🚀 Características
+
+- **Claude API** como cerebro inteligente
+- **PostgreSQL** en Railway para persistencia
+- **Clima en tiempo real** (OpenWeather)
+- **Spotify integrado** para música
+- **Finanzas tracking** (gastos, presupuesto, deuda)
+- **Plugins auto-generados** con Python
+- **Búsqueda web** (Tavily, SerpAPI)
+- **Sin morning routine** (simplificado)
+
+---
+
+## 📦 Despliegue en Railway
+
+### 1. Deploy automático desde GitHub
+
+```bash
+git push
+# Railway desplegará automáticamente
 ```
-/
-├── main.py           ← Backend Flask completo
-├── requirements.txt  ← Dependencias + gunicorn
-├── render.yaml       ← Config automática de Render
-└── static/
-    └── index.html    ← Frontend con voz
+
+### 2. Configurar variables en Railway
+
+```
+DATABASE_URL          → PostgreSQL (Railway proporciona)
+ANTHROPIC_API_KEY     → sk-ant-... (obtener en console.anthropic.com)
+```
+
+### 3. Verificar
+
+```bash
+curl https://tu-app.railway.app/api/health
 ```
 
 ---
 
-## Por qué Render > Replit para este proyecto
+## 🛠️ Local Development
 
-| | Render | Replit |
-|---|---|---|
-| Flask soporte | Nativo con gunicorn | Limitado |
-| DB persistente | /data disk incluido | No en free |
-| Sleep en free | 15 min inactividad | Sí |
-| Logs | Claros y en tiempo real | Ruidosos |
-| Deploy desde GitHub | Automático | Manual |
+```bash
+# Setup
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# Editar .env
+
+# Run
+python main.py
+# http://localhost:8080
+```
 
 ---
 
-## Notas importantes
+## 📋 Variables Requeridas
 
-- **Free tier de Render:** el servicio se duerme después de 15 min sin tráfico.
-  Primera request después del sleep tarda ~30 segundos (cold start).
-  Para uso personal esto es perfectamente aceptable.
+**Obligatorias:**
+- `DATABASE_URL` → PostgreSQL
+- `ANTHROPIC_API_KEY` → Claude API
 
-- **La DB persiste en /data:** recordatorios, alarmas, historial y finanzas
-  sobreviven reinicios y deploys.
+**Opcionales:**
+- `OPENWEATHER_API_KEY` → Clima
+- `SPOTIFY_CLIENT_ID/SECRET` → Música
+- `OWNER_PIN` → Seguridad
 
-- **Voz:** funciona via Web Speech API del navegador — no requiere nada extra.
+Ver `.env.example` para más detalles.
+
+---
+
+## ✅ Cambios en v2.0
+
+✅ Morning routine eliminada  
+✅ Arquitectura DIAN interna (6 capas)  
+✅ Reglas sin IF anidados  
+✅ Todos los demás features intactos  
+
+---
+
+## 📞 Documentación
+
+- [Railway Docs](https://docs.railway.app)
+- [Anthropic API](https://docs.anthropic.com)
+- [Flask](https://flask.palletsprojects.com)
+
+---
+
+**Vesper © 2024** | Agente Personal de Ozhelli
