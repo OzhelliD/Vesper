@@ -11,7 +11,7 @@ from types import ModuleType
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from alarms import AlarmManager
+
 import requests, urllib3, httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -21,6 +21,7 @@ urllib3.disable_warnings()
 from anthropic import Anthropic
 from flask import Flask, request, jsonify, send_from_directory, redirect, Response
 from flask_cors import CORS
+from alarms import AlarmManager
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
@@ -36,8 +37,8 @@ def get_pool():
             raise Exception("DATABASE_URL no configurada. Agrega PostgreSQL en Railway.")
         _db_pool = ThreadedConnectionPool(2, 10, DATABASE_URL)
     return _db_pool
-alarm_manager = AlarmManager(pool)
 
+alarm_manager = None  # Inicializado en main
 def db_q(query, params=None, fetch=None):
     pool = get_pool()
     conn = pool.getconn()
@@ -61,7 +62,6 @@ client = Anthropic(
 )
 
 OWNER_NAME            = "Ozhelli"
-from alarms import AlarmManager
 OWNER_DB              = "owner"
 GUESTS_DB             = "guests"
 OPENWEATHER_KEY       = os.environ.get("OPENWEATHER_API_KEY", "")
@@ -816,6 +816,14 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
     return final_response or "Listo.", music_action
 
 # ── Spotify OAuth ─────────────────────────────────────────────────────────────
+
+# ── Inicializar alarmas cuando Flask esté listo ──
+@app.before_request
+def init_alarm_manager():
+    global alarm_manager
+    if alarm_manager is None:
+        alarm_manager = AlarmManager(get_pool())
+
 @app.route("/spotify/login")
 def spotify_login():
     params = (f"response_type=code&client_id={SPOTIFY_CLIENT_ID}"
