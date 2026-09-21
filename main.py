@@ -434,7 +434,7 @@ def ai_song_for_weather(weather):
 # ── Tools base ────────────────────────────────────────────────────────────────
 BASE_TOOLS = [
     {"name":"set_alarm",
-     "description":"Programa una alarma\. HH:MM",
+     "description":"Programa una alarma. HH:MM",
      "input_schema":{"type":"object","properties":{"time":{"type":"string","description":"HH:MM"},"label":{"type":"string"}},"required":["time"]}},
     {"name":"set_reminder",
      "description":"Crea un recordatorio con fecha y hora.",
@@ -503,20 +503,8 @@ async def dispatch_action(tool_name, tool_input, db_path):
     if tool_name == "set_alarm":
         alarm_time  = tool_input["time"]
         label       = tool_input.get("label","Alarma")
-        is_morning  = is_morning_hour(alarm_time)
         db_q("INSERT INTO alarms (time, label) VALUES (%s, %s)", (alarm_time, label))
-        tipo = "morning routine" if is_morning else "alarma simple"
-        return f"Alarma programada para las {alarm_time} ({tipo})."
-        if is_morning:
-            hh, mm = map(int, alarm_time.split(":"))
-            amb_h  = hh if mm >= 20 else hh-1
-            amb_m  = (mm-20) % 60
-            return (f"Morning routine programada para las {alarm_time}, señor. "
-                    f"Música ambiental: {amb_h:02d}:{amb_m:02d}, "
-                    f"speech: {alarm_time}, "
-                    f"canción del clima: {hh:02d}:{(mm+10)%60:02d}.")
-        else:
-            return f"Alarma simple programada para las {alarm_time}."
+        return f"Alarma programada para las {alarm_time}."
 
     if tool_name == "set_reminder":
         db_q("INSERT INTO reminders (label, trigger_at) VALUES (%s, %s)",
