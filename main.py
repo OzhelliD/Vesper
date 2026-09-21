@@ -36,6 +36,7 @@ def get_pool():
             raise Exception("DATABASE_URL no configurada. Agrega PostgreSQL en Railway.")
         _db_pool = ThreadedConnectionPool(2, 10, DATABASE_URL)
     return _db_pool
+alarm_manager = AlarmManager(pool)
 
 def db_q(query, params=None, fetch=None):
     pool = get_pool()
@@ -60,6 +61,7 @@ client = Anthropic(
 )
 
 OWNER_NAME            = "Ozhelli"
+from alarms import AlarmManager
 OWNER_DB              = "owner"
 GUESTS_DB             = "guests"
 OPENWEATHER_KEY       = os.environ.get("OPENWEATHER_API_KEY", "")
