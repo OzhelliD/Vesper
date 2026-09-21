@@ -548,12 +548,11 @@ async def dispatch_action(tool_name, tool_input, db_path):
             return f"Config '{key}' no reconocida. Use 'monthly_budget' o 'auto_debt'."
 
         if action == "ajustar_disponible":
-            # Sumar/restar al presupuesto directamente
-            amount = tool_input.get("amount",0)
-            current = cfg.get("monthly_budget",28051)
-            new_val = current + amount
-            set_financial_config("monthly_budget", new_val)
-            return f"Presupuesto ajustado: ${current:,.0f} + ${amount:,.0f} = ${new_val:,.0f} MXN."
+            # ✅ ESTABLECER valor absoluto (no sumar)
+            amount = tool_input.get("amount", 0)
+            current = cfg.get("monthly_budget", 28051)
+            set_financial_config("monthly_budget", amount)
+            return f"Presupuesto ajustado: ${current:,.0f} → ${amount:,.0f} MXN."
 
         amount   = float(tool_input.get("amount", 0))
         category = tool_input.get("category", "general")
@@ -562,18 +561,34 @@ async def dispatch_action(tool_name, tool_input, db_path):
         db_q("INSERT INTO financial (action, amount, category, note) VALUES (%s, %s, %s, %s)",
              (action, amount, category, note))
 
-        # Si es abono al auto — descontar de la deuda automáticamente
-        auto_keywords = ["auto","carro","coche","honda","insight","luisiana","deuda"]
-        is_auto_payment = (action == "separar" and
-                           any(kw in category.lower() for kw in auto_keywords))
-        if is_auto_payment:
-            current_debt = cfg.get("auto_debt", 300000)
-            new_debt     = max(0, current_debt - amount)
-            set_financial_config("auto_debt", new_debt)
-            return (f"Abono al auto registrado: ${amount:,.0f} MXN. "
-                    f"Deuda anterior: ${current_debt:,.0f} → Nueva deuda: ${new_debt:,.0f} MXN."
-                    + (" ✅ ¡Deuda liquidada!" if new_debt == 0 else ""))
-
+        # ✅ ACTUALIZAR SALDO DISPONIBLE (monthly_budget)
+        current_budget = cfg.get("monthly_budget", 28051)
+        
+        if action == "registrar_gasto":
+            # Gasto: restar del presupuesto
+            new_budget = current_budget - amount
+            set_financial_config("monthly_budget", new_budget)
+            return f"Gasto registrado: ${amount:,.0f} MXN ({category}). Presupuesto: ${current_budget:,.0f} → ${new_budget:,.0f} MXN."
+        
+        if action == "separar":
+            # Abono: sumar al presupuesto disponible
+            new_budget = current_budget + amount
+            set_financial_config("monthly_budget", new_budget)
+            
+            # Si es abono al auto — descontar de la deuda automáticamente
+            auto_keywords = ["auto","carro","coche","honda","insight","luisiana","deuda"]
+            is_auto_payment = any(kw in category.lower() for kw in auto_keywords)
+            if is_auto_payment:
+                current_debt = cfg.get("auto_debt", 300000)
+                new_debt     = max(0, current_debt - amount)
+                set_financial_config("auto_debt", new_debt)
+                return (f"Abono al auto registrado: ${amount:,.0f} MXN. "
+                        f"Presupuesto: ${current_budget:,.0f} → ${new_budget:,.0f} MXN. "
+                        f"Deuda auto: ${current_debt:,.0f} → ${new_debt:,.0f} MXN."
+                        + (" ✅ ¡Deuda liquidada!" if new_debt == 0 else ""))
+            
+            return f"Abono registrado: ${amount:,.0f} MXN ({category}). Presupuesto: ${current_budget:,.0f} → ${new_budget:,.0f} MXN."
+        
         return f"Registrado: {action} ${amount:,.0f} MXN ({category})."
 
     # ── Web search ─────────────────────────────────────────────────────────────
