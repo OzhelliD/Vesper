@@ -51,3 +51,14 @@ En cada mensaje se arma y se inyecta al modelo:
 
 ## Dependencias nuevas
 `python-docx`, `openpyxl`, `tzdata` (ya están en requirements.txt). La tabla `preference_candidates` se crea sola al arrancar.
+
+## 6. Finanzas y outfits como tarjetas (ya no hay paneles fijos)
+- Se quitaron los paneles de Finanzas y Outfits de la barra derecha. En pantallas grandes, esa barra ahora solo muestra Spotify y el Estado del día.
+- **Finanzas:** cuando Vesper usa `financial_action` (preguntas cómo vas, registras un gasto o un abono), aparece una tarjeta dentro de su respuesta con:
+  - lo disponible y la deuda del auto, con una barra de lo gastado en el mes;
+  - pestañas **Por categoría** y **Movimientos**, con "Ver todos";
+  - un botón ↻ para actualizar, que usa `GET /api/financial/summary` y pide PIN;
+  - botones rápidos: **+ Gasto**, **+ Abono al auto** y **Analizar**.
+- Se corrigió un error del panel viejo: restaba los gastos dos veces. `monthly_budget` ya es lo disponible, porque el backend le resta cada gasto.
+- **Outfits:** hay una tool nueva, `show_outfits`. Cuando pides ideas de ropa, aparece una galería. Al tocar una foto se abre en grande con el botón **Más como este**, y el botón **↻ Otro estilo** busca otra tanda.
+- En modo voz, la tarjeta aparece debajo de la respuesta.

@@ -473,6 +473,14 @@ BASE_TOOLS = [
     {"name":"create_playlist",
      "description":"Crea una playlist en Spotify basada en un mood.",
      "input_schema":{"type":"object","properties":{"mood":{"type":"string"},"count":{"type":"integer"}},"required":["mood"]}},
+    {"name":"show_outfits",
+     "description":("Muestra en pantalla una galería de outfits/ropa. Úsala cuando el señor pida ideas de "
+                    "ropa, outfits o qué ponerse. Considera su estilo (smart casual europeo, tonos tierra), "
+                    "el clima y la ocasión."),
+     "input_schema":{"type":"object","properties":{
+         "query":{"type":"string","description":"Búsqueda de imágenes EN INGLÉS, ej. 'men smart casual office outfit beige chinos'"},
+         "occasion":{"type":"string","description":"Ocasión en español, ej. 'oficina', 'cena', 'fin de semana'"}
+     },"required":["query"]}},
     {"name":"view_camera",
      "description":"Obtiene imagen de una cámara pública por URL o nombre de ciudad.",
      "input_schema":{"type":"object","properties":{
@@ -493,6 +501,13 @@ async def dispatch_action(tool_name, tool_input, db_path):
     if tool_name == "confirm_preference":
         return preferences.confirm(db_q, tool_input.get("key",""),
                                    bool(tool_input.get("accepted")), tool_input.get("value"))
+
+    # ── Outfits (se muestran como tarjeta en la UI) ───────────────────────────
+    if tool_name == "show_outfits":
+        q = tool_input.get("query") or "men smart casual outfit earth tones"
+        imgs = await asyncio.to_thread(search_outfit_images, q)
+        return json.dumps({"action":"show_outfits","query":q,
+                           "occasion":tool_input.get("occasion",""),"images":imgs})
 
     # ── Cámaras públicas ───────────────────────────────────────────────────────
     if tool_name == "view_camera":
@@ -800,6 +815,8 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
         "- SIEMPRE usa web_search para noticias, deportes, precios, clima detallado.\n"
         "- NUNCA respondas esas preguntas sin buscar primero.\n"
         + behavior + style +
+        "- Tarjetas en pantalla: cuando uses financial_action o show_outfits, la interfaz muestra "
+        "una tarjeta interactiva con los datos/imágenes; no repitas todas las cifras, resume lo clave.\n"
         "- Si el señor adjunta archivos o fotos (tablas nutrimentales, PDFs, Excel), analízalos con "
         "sus reglas fijas y su contexto.\n"
         "- Español directo.\n"
@@ -825,6 +842,8 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
     messages       = history
     final_response = ""
     music_action   = None
+    ui_cards       = []
+    used_finance   = False
 
     for _ in range(8):   # tope de vueltas de herramientas
         tools_to_use = get_all_tools() if is_owner else []
@@ -842,8 +861,24 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
             if tu.name in ("play_song","create_playlist","play_playlist"):
                 try: music_action = json.loads(results[i])
                 except: pass
+            elif tu.name == "financial_action":
+                used_finance = True
+            elif tu.name == "show_outfits":
+                try:
+                    d = json.loads(results[i])
+                    ui_cards = [c for c in ui_cards if c["type"] != "outfits"]
+                    ui_cards.append({"type":"outfits","query":d["query"],
+                                     "occasion":d.get("occasion",""),"images":d["images"]})
+                    results[i] = (f"Galería mostrada en pantalla con {len(d['images'])} imágenes."
+                                  if d["images"] else "No se encontraron imágenes de outfits.")
+                except Exception as e:
+                    print(f"[OUTFITS] tarjeta: {e}")
         tool_results = [{"type":"tool_result","tool_use_id":tool_uses[i].id,"content":str(results[i])} for i in range(len(tool_uses))]
         messages.append({"role":"user","content":tool_results})
+
+    if used_finance and is_owner:
+        try: ui_cards.insert(0, {"type":"finance", **finance_snapshot()})
+        except Exception as e: print(f"[FINANCE] tarjeta: {e}")
 
     if final_response:
         save_message("assistant", final_response, bucket)
@@ -853,7 +888,7 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
             threading.Thread(target=extract_and_save_memories,
                              args=(recent, saved_text, final_response, session),
                              daemon=True).start()
-    return final_response or "Listo.", music_action
+    return final_response or "Listo.", music_action, ui_cards
 
 # ── Spotify OAuth ─────────────────────────────────────────────────────────────
 
@@ -944,6 +979,34 @@ def camera_proxy():
         return f"Error: {e}", 500
 
 # ── Finanzas ──────────────────────────────────────────────────────────────────
+def finance_snapshot():
+    """Datos para la tarjeta financiera interactiva.
+    monthly_budget YA es el disponible: registrar_gasto le resta y separar le suma."""
+    cfg   = get_financial_config()
+    start = now_local().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month = db_q("""SELECT category, SUM(amount) AS total FROM financial
+                    WHERE action='registrar_gasto' AND created_at >= %s
+                    GROUP BY category ORDER BY total DESC""", (start,), fetch="all") or []
+    recent = db_q("""SELECT action, amount, category, note, created_at FROM financial
+                     ORDER BY created_at DESC LIMIT 12""", fetch="all") or []
+    spent = sum(float(r["total"] or 0) for r in month)
+    return {
+        "available": float(cfg.get("monthly_budget", 28051)),
+        "auto_debt": float(cfg.get("auto_debt", 300000)),
+        "spent_month": spent,
+        "by_category": [{"category": r["category"] or "general", "total": float(r["total"] or 0)} for r in month],
+        "recent": [{"action": r["action"], "amount": float(r["amount"] or 0), "category": r["category"],
+                    "note": r["note"], "date": r["created_at"].isoformat()} for r in recent],
+        "month_label": ["enero","febrero","marzo","abril","mayo","junio","julio","agosto",
+                        "septiembre","octubre","noviembre","diciembre"][start.month-1],
+    }
+
+@app.route("/api/financial/summary", methods=["GET"])
+def financial_summary():
+    if not _pin_ok():
+        return jsonify({"error":"PIN requerido"}), 401
+    return jsonify(finance_snapshot())
+
 @app.route("/api/financial", methods=["GET"])
 def get_financial():
     try:
@@ -1024,11 +1087,12 @@ def chat():
         _session_cache[OWNER_NAME] = session
     try:
         loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-        resp, music_action = loop.run_until_complete(
+        resp, music_action, ui_cards = loop.run_until_complete(
             orchestrate(user_message, session, image_base64, image_type,
                         attachments=attachments, client_ctx=client_ctx))
         loop.close()
-        return jsonify({"response":resp,"user":session["name"],"music_action":music_action})
+        return jsonify({"response":resp,"user":session["name"],"music_action":music_action,
+                        "ui_cards":ui_cards})
     except Exception as e:
         print(f"[ERROR] {e}"); traceback.print_exc()
         return jsonify({"error":str(e)}), 500
@@ -1082,7 +1146,11 @@ def get_notifications():
 
 @app.route("/api/outfit-search")
 def outfit_search():
-    query       = request.args.get("q","smart casual men outfit earth tones")
+    query  = request.args.get("q","smart casual men outfit earth tones")
+    images = search_outfit_images(query)
+    return jsonify({"images":images,"query":query})
+
+def search_outfit_images(query):
     images      = []
     serpapi_key = os.environ.get("SERPAPI_KEY","")
     pixabay_key = os.environ.get("PIXABAY_KEY","")
@@ -1130,7 +1198,7 @@ def outfit_search():
             print(f"[OUTFITS] Unsplash: {e}")
 
     print(f"[OUTFITS] {len(images)} imgs para '{query}'")
-    return jsonify({"images":images,"query":query})
+    return images
 
 # ── Webhook Microsoft (Outlook + Teams) ──────────────────────────────────────
 RELEVANCE_RULES = {
