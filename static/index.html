@@ -444,6 +444,19 @@ body.mode-voice .mic-sm { display: none; }
 .outfit-tile:hover img { transform: scale(1.04); }
 .outfit-tile:hover { border-color: var(--cyan); }
 .card-empty { font-size:13px; color:var(--text2); padding:10px 0; }
+/* Tabla de datos (base de datos dinámica) */
+.dt-count { font-size:11px; color:var(--text2); margin-left:6px; letter-spacing:0; text-transform:none; font-family:inherit; }
+.dt-wrap { overflow-x:auto; margin:0 -4px; -webkit-overflow-scrolling:touch; }
+.dt { border-collapse:collapse; width:100%; font-size:13px; font-variant-numeric:tabular-nums; }
+.dt th { text-align:left; font-weight:500; color:var(--text2); font-size:11px; padding:6px 8px; border-bottom:1px solid var(--border); white-space:nowrap; }
+.dt td { padding:7px 8px; border-bottom:1px solid rgba(26,58,92,.5); color:var(--text); max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dt tr:last-child td { border-bottom:0; }
+.dt td.num, .dt th.num { text-align:right; }
+.dt .hl, .kv .hl { color:var(--cyan); }
+.dt td.nil, .kv .nil { color:var(--text2); }
+.kv { display:grid; grid-template-columns:minmax(90px,auto) 1fr; gap:6px 14px; font-size:13px; }
+.kv dt { color:var(--text2); font-size:12px; }
+.kv dd { margin:0; color:var(--text); overflow-wrap:anywhere; }
 .lightbox {
   position:fixed; inset:0; z-index:300; background:rgba(3,7,15,.92);
   display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:20px;
@@ -1292,6 +1305,7 @@ function renderCards(cards){
   (cards||[]).forEach(c => {
     if(c.type === "finance") wrap.appendChild(financeCard(c));
     else if(c.type === "outfits") wrap.appendChild(outfitCard(c));
+    else if(c.type === "data_table") wrap.appendChild(dataCard(c));
   });
   return wrap;
 }
@@ -1352,6 +1366,88 @@ function financeCard(data){
     }
     else if(b.dataset.fill){ fillComposer(b.dataset.fill); }
     else if(b.dataset.ask){ tiEl.value = b.dataset.ask; send(); }
+  });
+  draw(data);
+  return el;
+}
+// ── Tarjeta de tabla (base de datos dinámica) ──
+const DT_HIDDEN = ["creado_en","actualizado_en"];
+const colLabel = c => c === "count" ? "registros" : c
+  .replace(/^avg_/, "promedio_").replace(/^sum_/, "total_").replace(/^min_/, "mínimo_").replace(/^max_/, "máximo_")
+  .replace(/^(fecha\w*|creado_en)_(dia|semana|mes|anio)$/, "$2").replace(/^anio$/, "año")
+  .replace(/^pct_/, "% ").replace(/_pct$/, " %").replace(/_/g, " ");
+function cellFmt(v){
+  if(v === null || v === undefined || v === "") return {t:"—", nil:true};
+  if(typeof v === "boolean") return {t: v ? "Sí" : "No"};
+  if(typeof v === "number") return {t: v.toLocaleString("es-MX", {maximumFractionDigits: 2}), num:true};
+  if(typeof v === "object") return {t: JSON.stringify(v)};
+  if(/^\d{4}-\d{2}-\d{2}$/.test(v)){
+    const d = new Date(v + "T12:00:00");
+    return {t: d.toLocaleDateString("es-MX", {day:"numeric", month:"short", year:"numeric"})};
+  }
+  if(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v)){
+    const d = new Date(v);
+    return {t: d.toLocaleString("es-MX", {day:"numeric", month:"short", hour:"2-digit", minute:"2-digit"})};
+  }
+  return {t: String(v)};
+}
+function dataCard(data){
+  const el = document.createElement("div");
+  el.className = "ui-card";
+  let showAll = false;
+  const canRefresh = data.table && data.table !== "consulta";
+  const draw = d => {
+    const hl = new Set(d.highlight || []);
+    const cols = (d.columns || []).filter(c => !DT_HIDDEN.includes(c) && !(c === "id" && d.rows.length === 1));
+    let body;
+    if(!d.rows.length){
+      body = `<div class="card-empty">Sin filas.</div>`;
+    } else if(d.rows.length === 1){
+      const r = d.rows[0];
+      body = `<dl class="kv">${cols.map(c => { const f = cellFmt(r[c]);
+        return `<dt class="${hl.has(c)?"hl":""}">${esc(colLabel(c))}</dt><dd class="${f.nil?"nil":""} ${hl.has(c)?"hl":""}">${esc(f.t)}</dd>`; }).join("")}</dl>`;
+    } else {
+      const rows = showAll ? d.rows : d.rows.slice(0, 8);
+      const isNum = c => d.rows.some(r => typeof r[c] === "number") && d.rows.every(r => r[c] === null || typeof r[c] === "number");
+      const numCols = new Set(cols.filter(isNum));
+      body = `<div class="dt-wrap"><table class="dt"><thead><tr>${cols.map(c =>
+          `<th class="${numCols.has(c)?"num":""} ${hl.has(c)?"hl":""}">${esc(colLabel(c))}</th>`).join("")}</tr></thead>
+        <tbody>${rows.map(r => `<tr>${cols.map(c => { const f = cellFmt(r[c]);
+          return `<td class="${numCols.has(c)?"num":""} ${f.nil?"nil":""} ${hl.has(c)?"hl":""}" title="${esc(f.t)}">${esc(f.t)}</td>`; }).join("")}</tr>`).join("")}
+        </tbody></table></div>` +
+        (d.rows.length > 8 ? `<button class="card-btn" data-act="more" style="margin-top:8px">${showAll ? "Ver menos" : "Ver todas (" + d.rows.length + ")"}</button>` : "");
+    }
+    const more = d.total > d.rows.length ? ` de ${d.total}` : "";
+    el.innerHTML = `
+      <div class="card-head"><span class="card-title">${esc(d.title || d.table)}<span class="dt-count">${d.rows.length}${more} ${d.total === 1 ? "registro" : "registros"}</span></span>
+        <span style="display:flex;gap:6px">${canRefresh ? `<button class="card-btn" data-act="all" title="Ver la tabla completa">Tabla</button>
+        <button class="card-btn" data-act="csv" title="Descargar CSV">CSV</button>` : ""}</span></div>
+      ${body}`;
+  };
+  const pinHdr = () => ({"X-Vesper-Pin": store.get("vesper_pin") || ""});
+  el.addEventListener("click", async e => {
+    const b = e.target.closest("button"); if(!b) return;
+    if(b.dataset.act === "more"){ showAll = !showAll; draw(data); }
+    else if(b.dataset.act === "all"){
+      b.disabled = true;
+      try{
+        const r = await fetch(`/api/data/${encodeURIComponent(data.table)}?limit=200`, {headers: pinHdr()});
+        if(r.ok){ const j = await r.json(); data = {...data, title: j.table.replace(/_/g," "), columns: j.columns, rows: j.rows, total: j.total, highlight: []}; showAll = false; draw(data); }
+      }catch(err){}
+      b.disabled = false;
+    }
+    else if(b.dataset.act === "csv"){
+      b.disabled = true;
+      try{
+        const r = await fetch(`/api/data/${encodeURIComponent(data.table)}?format=csv`, {headers: pinHdr()});
+        if(r.ok){
+          const url = URL.createObjectURL(await r.blob());
+          const a = Object.assign(document.createElement("a"), {href: url, download: data.table + ".csv"});
+          document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 2000);
+        }
+      }catch(err){}
+      b.disabled = false;
+    }
   });
   draw(data);
   return el;
