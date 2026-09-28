@@ -69,3 +69,60 @@ No hay dependencias nuevas. El esquema, `_catalogo` y `_bitacora` se crean solos
 
 ## Tipos de columna que entiende
 `texto`, `numero`, `entero`, `booleano`, `fecha`, `fecha_hora`, `hora`, `json`, además de `email`, `url` y `telefono`, que se guardan como texto. Si Vesper crea una columna al vuelo sin indicar el tipo, lo deduce del valor: los números se vuelven `numero`, `"2026-09-28"` se vuelve `fecha` y el resto `texto`.
+
+## Recordatorios duplicados (reporte del 28/09)
+- **Problema:** un recordatorio de prueba llegó 3 veces. Railway corre 2 procesos (`--workers 2`) y cada uno tiene su propio revisor de recordatorios, así que los dos lo disparaban. Además, cada aviso se guardaba en la tabla `notifications` y también en una lista en memoria, y `/api/notifications` entregaba los dos.
+- **Solución:** cada recordatorio y cada alarma se "reclaman" con `UPDATE ... WHERE status='pending' RETURNING`, así que solo lo dispara el primer proceso que llega. La tabla `notifications` es la única fuente, y la entrega también es atómica (`UPDATE ... SET delivered=TRUE ... RETURNING`), así que aunque tengas la app abierta en el celular y en la compu, cada aviso sale una sola vez.
+- Probado con 3 revisores simultáneos y 2 consultas al mismo tiempo: se entregó 1 aviso.
+
+## Recordatorios que Vesper decide cómo preparar
+- `set_reminder` tiene un campo nuevo, `prepare`. **Vesper decide** cuándo usarlo:
+  - si el recordatorio implica algo que puede preparar (plan de comidas con cantidades, resumen de tus tablas, clima para una salida, noticias), deja escrita la instrucción;
+  - para avisos simples ("llamar a mamá") lo deja vacío y el aviso sale como antes.
+- Regla nueva en el prompt: si promete contenido ("te aviso con el plan"), está obligado a llenar `prepare`. Así se evita lo que pasó el 28/09, cuando el recordatorio llegó solo con el título.
+- Cuando suena, Vesper genera el contenido en ese momento con tu contexto (hora, clima, memorias, preferencias y tus tablas) y puede consultar tus tablas, tus finanzas e internet. **Solo lectura**: no puede modificar nada mientras prepara un recordatorio.
+- Se muestra como mensaje completo con formato. En modo voz lo lee entero; en modo texto dice el título y "le dejé el detalle en pantalla".
+- Queda guardado en el historial, así que después puedes preguntar "¿cuánto queso dijiste?".
+- Si la generación falla, el aviso llega igual con la instrucción original.
+- La app revisa avisos cada 20 s (antes cada 45 s) y también al volver a abrir la pestaña.
+- Columnas nuevas, creadas solas al arrancar: `reminders.prepare` y `notifications.body`.
+
+## Imágenes y fuentes con enlace
+- `web_search` ahora devuelve resultados numerados [1], [2]… con su fuente, y la interfaz los muestra en una tarjeta con enlaces.
+- **Vesper decide** cuándo pedir imágenes (`images=true`): personas, lugares, productos, platillos, ejercicios. No las pide para precios, marcadores o clima.
+- De dónde salen las imágenes, siempre con enlace a la página de origen:
+  1. **SerpAPI** (Google Images), si configuras `SERPAPI_KEY`. Es la mejor opción.
+  2. **Wikipedia**: gratis y sin llave; da la imagen del artículo con enlace al artículo.
+  3. **Tavily**: la imagen se enlaza al artículo del mismo sitio.
+- Cuidados para no romper la interfaz:
+  - tira horizontal de miniaturas de tamaño fijo, que se desliza en el celular;
+  - si una imagen no carga, se quita sola;
+  - solo se aceptan imágenes `https`;
+  - las fuentes se muestran en una línea cada una, cortando lo que no cabe, y solo las 3 primeras, con "Ver más".
+- Al tocar una imagen se abre en grande con el botón **Abrir fuente ↗**.
+- Si en un turno hay varias búsquedas, se juntan en una sola tarjeta.
+- Archivo nuevo: `web_media.py`.
+
+## Modo radio: música continua sin crear playlist
+**Por qué no un thread:** la música no suena en el servidor de Vesper, suena en tu dispositivo de Spotify (celular, compu o bocina). Vesper le entrega a Spotify una cola de canciones, y Spotify las encadena solo aunque Vesper esté pensando, respondiendo o hablando. Así, una respuesta de Vesper nunca puede cortar la música.
+
+- Tool nueva **`play_music`** para pedidos como "pon música country", "algo para concentrarme" o "más como esta".
+  - Vesper elige unas 14 canciones con tus gustos musicales guardados en memoria.
+  - Las busca en Spotify en paralelo y las reproduce en orden, sin aleatorio y sin repetir la lista.
+  - No crea playlist.
+- **El DJ en segundo plano** (`music_radio.tick()`, cada 20 s dentro del scheduler):
+  - cuando quedan 2 canciones, elige 8 más del mismo estilo sin repetir ninguna que ya sonó y las agrega a la cola de Spotify;
+  - con varios workers, solo uno rellena, porque el relleno se reclama con `UPDATE ... RETURNING`;
+  - si pones otra cosa por tu cuenta, la radio se apaga sola;
+  - `play_song`, `play_playlist` y `create_playlist` también la apagan.
+- **`music_control`**: pausar, reanudar, siguiente, anterior, detener, volumen, `que_suena` (qué suena y qué sigue).
+- **Baja la música mientras Vesper habla:** cuando Vesper empieza a hablar, el volumen baja a 25% y regresa al terminar.
+  - Solo funciona en dispositivos que permiten cambiar el volumen (compu, bocinas). En iPhone Spotify no lo permite.
+  - Si el navegador no avisa que Vesper terminó, el volumen se restaura solo a los 90 s.
+- Sin tarjeta en el chat: en escritorio la canción se ve en el "Now playing" del panel derecho y en el celular no se muestra. Vesper confirma en su respuesta qué puso.
+- Si no hay ningún Spotify abierto, Vesper te pide abrirlo; basta con abrir la app.
+- **Archivo nuevo:** `music_radio.py`. Tabla nueva `music_session`, que se crea sola al arrancar.
+- **Endpoints nuevos** (con PIN):
+  - `POST /api/music/control` con `{action, volume}`;
+  - `POST /api/music/duck` con `{on}`.
+- `/spotify/now-playing` ahora incluye `radio: true/false`.

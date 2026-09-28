@@ -1028,6 +1028,11 @@ def invalidate_cache():
 
 PROMPT_RULES = (
     "BASE DE DATOS DINÁMICA (tools db_*):\n"
+    "- YA tienes acceso real a la base de datos. NUNCA propongas SQL, esquemas ni funciones nuevas "
+    "(tipo 'contacts_action') para que el señor las implemente, y NUNCA digas que algo 'no está implementado' "
+    "para guardar datos. Si pide una tabla, créala con db_create_table en ese momento; si da datos, guárdalos con "
+    "db_save en el mismo turno (si la tabla no existe, créala primero y luego guarda).\n"
+    "- Si en el historial dijiste antes que no podías guardar en la base, eso ya no aplica: hazlo ahora.\n"
     "- Tú administras las tablas del señor. Cualquier dato estructurado que quiera guardar, buscar, "
     "cambiar, borrar o analizar (contactos, medidas, inventarios, listas, registros diarios...) va con las tools db_*.\n"
     "- Antes de crear una tabla revisa la lista de arriba: si ya hay una que sirve, úsala; no dupliques. "

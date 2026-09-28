@@ -26,6 +26,8 @@ from attachments import build_attachment_blocks
 from context_snapshot import build_context_snapshot, now_local
 import preferences
 import data_manager
+import web_media
+import music_radio
 
 app = Flask(__name__, static_folder="static")
 # Adjuntos: hasta 5 archivos de 20 MB en base64 (~1.37x)
@@ -198,6 +200,8 @@ def init_owner_db():
             notes TEXT, visit_count INTEGER DEFAULT 1,
             last_visited TIMESTAMPTZ,
             created_at TIMESTAMPTZ DEFAULT NOW())""",
+        "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS prepare TEXT",
+        "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS body TEXT",
         """CREATE TABLE IF NOT EXISTS location_history (
             id SERIAL PRIMARY KEY,
             place_name TEXT, address TEXT,
@@ -255,6 +259,10 @@ def init_owner_db():
         print(f"[DATA] No se pudo inicializar: {e}")
 
     load_spotify_tokens_from_db()
+    try:
+        music_radio.init(db_q, spotify_headers, client)
+    except Exception as e:
+        print(f"[RADIO] No se pudo inicializar: {e}")
     print("[DB] Inicializado")
 
 def get_financial_config():
@@ -457,8 +465,19 @@ BASE_TOOLS = [
      "description":"Programa una alarma. HH:MM",
      "input_schema":{"type":"object","properties":{"time":{"type":"string","description":"HH:MM"},"label":{"type":"string"}},"required":["time"]}},
     {"name":"set_reminder",
-     "description":"Crea un recordatorio con fecha y hora.",
-     "input_schema":{"type":"object","properties":{"label":{"type":"string"},"trigger_at":{"type":"string"},"person":{"type":"string"}},"required":["label","trigger_at"]}},
+     "description":("Crea un recordatorio con fecha y hora. TÚ decides si al sonar debe traer contenido preparado: "
+                    "si el recordatorio implica algo que tú puedes preparar en ese momento (plan de comidas con cantidades, "
+                    "resumen de sus tablas o avances, clima/tráfico para una salida, noticias, pendientes, lo que le "
+                    "prometiste), escribe en 'prepare' la instrucción detallada de qué generar. Para avisos simples "
+                    "('llamar a mamá', 'sacar la basura') deja 'prepare' vacío."),
+     "input_schema":{"type":"object","properties":{
+         "label":{"type":"string","description":"Título corto del aviso"},
+         "trigger_at":{"type":"string","description":"YYYY-MM-DD HH:MM -0600"},
+         "person":{"type":"string"},
+         "prepare":{"type":"string","description":("Opcional. Instrucción para ti mismo de qué contenido generar al sonar, "
+                    "con todo el contexto necesario (metas, preferencias, qué incluir). Ej: 'Arma el desayuno de hoy con "
+                    "cantidades exactas: claras con queso manchego, meta 1,700-1,800 kcal y 150 g de proteína al día.'")}},
+         "required":["label","trigger_at"]}},
     {"name":"financial_action",
      "description":("Finanzas del señor. Conceptos: DISPONIBLE = dinero que le queda (monthly_budget; cada gasto le resta). "
                     "GASTADO DEL MES = suma de gastos registrados este mes. DEUDA AUTO = auto_debt.\n"
@@ -475,9 +494,7 @@ BASE_TOOLS = [
          "config_key":{"type":"string","description":"'monthly_budget' o 'auto_debt'"},
          "config_value":{"type":"number"}
      },"required":["action"]}},
-    {"name":"web_search",
-     "description":"Busca información actualizada en internet.",
-     "input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
+    web_media.TOOL,
     {"name":"play_song",
      "description":"Reproduce una canción en Spotify.",
      "input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
@@ -505,7 +522,7 @@ BASE_TOOLS = [
 
 def get_all_tools():
     """Tools base + confirmación de preferencias + base de datos dinámica."""
-    return BASE_TOOLS + [preferences.CONFIRM_TOOL] + data_manager.TOOLS
+    return BASE_TOOLS + music_radio.TOOLS + [preferences.CONFIRM_TOOL] + data_manager.TOOLS
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 async def dispatch_action(tool_name, tool_input, db_path):
@@ -560,10 +577,12 @@ async def dispatch_action(tool_name, tool_input, db_path):
         return f"Alarma programada para las {alarm_time}."
 
     if tool_name == "set_reminder":
-        db_q("INSERT INTO reminders (label, trigger_at) VALUES (%s, %s)",
-             (tool_input["label"], tool_input["trigger_at"]))
+        prep = (tool_input.get("prepare") or "").strip() or None
+        db_q("INSERT INTO reminders (label, trigger_at, prepare) VALUES (%s, %s, %s)",
+             (tool_input["label"], tool_input["trigger_at"], prep))
         p = tool_input.get("person","")
-        return f"Recordatorio '{tool_input['label']}'{' sobre '+p if p else ''} para {tool_input['trigger_at']}."
+        return (f"Recordatorio '{tool_input['label']}'{' sobre '+p if p else ''} para {tool_input['trigger_at']}."
+                + (" Al sonar prepararé el contenido indicado." if prep else ""))
 
     # ── Finanzas en tiempo real ────────────────────────────────────────────────
     if tool_name == "financial_action":
@@ -642,37 +661,25 @@ async def dispatch_action(tool_name, tool_input, db_path):
         
         return f"Registrado: {action} ${amount:,.0f} MXN ({category})."
 
-    # ── Web search ─────────────────────────────────────────────────────────────
+    # ── Web search (con fuentes enlazadas e imágenes opcionales) ──────────────
     if tool_name == "web_search":
-        query      = tool_input["query"]
-        tavily_key = os.environ.get("TAVILY_API_KEY","")
-        print(f"[WEB_SEARCH] '{query}'")
-        if tavily_key:
-            try:
-                r = requests.post("https://api.tavily.com/search",
-                    json={"api_key":tavily_key,"query":query,"max_results":3,"search_depth":"basic"},
-                    timeout=10)
-                if r.status_code == 200:
-                    results = r.json().get("results",[])
-                    if results:
-                        return "\n\n".join([f"{x['title']}: {x['content'][:250]}" for x in results])
-            except Exception as e:
-                print(f"[TAVILY] Error: {e}")
-        # Fallback DDG
+        res = await asyncio.to_thread(web_media.search, tool_input.get("query",""),
+                                      bool(tool_input.get("images")), tool_input.get("image_query"))
+        return json.dumps({"_web": True, **res}, ensure_ascii=False)
+
+    # ── Radio continua (sin playlist) ─────────────────────────────────────────
+    if tool_name == "play_music":
         try:
-            r = requests.get("https://api.duckduckgo.com/",
-                    params={"q":query,"format":"json","no_html":1}, timeout=8)
-            d = r.json()
-            txt = d.get("AbstractText","")
-            if not txt and d.get("RelatedTopics"):
-                first = d["RelatedTopics"][0]
-                txt = first.get("Text","") if isinstance(first,dict) else ""
-            return txt[:300] if txt else "Sin resultados."
+            res = await asyncio.to_thread(music_radio.start, tool_input.get("mood") or "música variada")
         except Exception as e:
-            return f"Error búsqueda: {e}"
+            res = {"action":"radio_error","error":str(e)}
+        return json.dumps(res, ensure_ascii=False)
+    if tool_name == "music_control":
+        return await asyncio.to_thread(music_radio.control, tool_input.get("action"), tool_input.get("volume"))
 
     # ── Spotify ────────────────────────────────────────────────────────────────
     if tool_name == "play_song":
+        music_radio.deactivate("el señor pidió una canción específica")
         if not get_spotify_token(): return json.dumps({"action":"spotify_login_required"})
         track = spotify_search_track(tool_input["query"])
         if not track: return f"No encontré '{tool_input['query']}' en Spotify."
@@ -684,6 +691,7 @@ async def dispatch_action(tool_name, tool_input, db_path):
         return "Error reproduciendo en Spotify."
 
     if tool_name == "play_playlist":
+        music_radio.deactivate("el señor pidió una playlist")
         playlist = spotify_search_playlist(tool_input["query"])
         if not playlist: return f"No encontré playlist '{tool_input['query']}'."
         devices   = spotify_get_devices()
@@ -694,6 +702,7 @@ async def dispatch_action(tool_name, tool_input, db_path):
         return "Error reproduciendo playlist."
 
     if tool_name == "create_playlist":
+        music_radio.deactivate("se creó una playlist")
         mood  = tool_input["mood"]
         count = min(tool_input.get("count",15), 50)
         data  = ai_generate_playlist(mood, count)
@@ -850,6 +859,12 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
         "- FINANZAS: nunca digas que cambiaste un valor si no lo hiciste con financial_action y el "
         "resultado de la tool lo confirma. Si te piden varios cambios, haz una llamada por cada uno. "
         "Si algo no se puede cambiar, dilo.\n"
+        "- IMÁGENES Y FUENTES: al usar web_search decide tú si pedir images=true (cuando ver algo ayude: "
+        "personas, lugares, productos, platillos, ejercicios...). Las fuentes e imágenes salen en una tarjeta con "
+        "enlaces; no pegues URLs en tu respuesta.\n"
+        + music_radio.PROMPT_RULES +
+        "- RECORDATORIOS: si al programar uno le prometes contenido ('te aviso con el plan', 'te mando el resumen'), "
+        "pon en 'prepare' la instrucción completa; si no, no prometas contenido.\n"
         "- Tarjetas en pantalla: cuando uses financial_action o show_outfits, la interfaz muestra "
         "una tarjeta interactiva con los datos/imágenes; no repitas todas las cifras, resume lo clave.\n"
         "- Si el señor adjunta archivos o fotos (tablas nutrimentales, PDFs, Excel), analízalos con "
@@ -897,8 +912,34 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
             if tu.name in ("play_song","create_playlist","play_playlist"):
                 try: music_action = json.loads(results[i])
                 except: pass
+            elif tu.name == "play_music":
+                try:
+                    d = json.loads(results[i])
+                    music_action = d
+                    if d.get("action") == "radio":
+                        results[i] = (f"Radio '{d['mood']}' sonando en {d.get('device') or 'Spotify'}: "
+                                      f"{d['name']} — {d['artist']}. Siguen: {'; '.join(d.get('upcoming',[]))}. "
+                                      f"({d['total']} canciones en cola; se rellena sola.)")
+                    elif d.get("action") == "spotify_no_device":
+                        results[i] = "No hay ningún dispositivo con Spotify abierto. Pide al señor que abra Spotify en su celular o compu."
+                    elif d.get("action") == "spotify_login_required":
+                        results[i] = "Spotify no está conectado; se abrirá la ventana para autorizar."
+                    else:
+                        results[i] = d.get("error","No se pudo iniciar la radio.")
+                except Exception as e:
+                    print(f"[RADIO] tarjeta: {e}")
             elif tu.name == "financial_action":
                 used_finance = True
+            elif tu.name == "web_search":
+                try:
+                    d = json.loads(results[i])
+                    results[i] = d.get("text", "")
+                    if d.get("card"):
+                        prev = next((c for c in ui_cards if c["type"] == "web"), None)
+                        if prev: web_media.merge_cards(prev, d["card"])
+                        else: ui_cards.append(d["card"])
+                except Exception as e:
+                    print(f"[WEB] tarjeta: {e}")
             elif tu.name in data_manager.TOOL_NAMES:
                 try:
                     d = json.loads(results[i])
@@ -993,7 +1034,27 @@ def spotify_now_playing():
                     "uri":item.get("uri",""),
                     "progress":d.get("progress_ms",0),
                     "duration":item.get("duration_ms",0),
-                    "playing":d.get("is_playing",False)})
+                    "playing":d.get("is_playing",False),
+                    "radio":music_radio.is_active()})
+
+@app.route("/api/music/control", methods=["POST"])
+def music_control_api():
+    if not _pin_ok():
+        return jsonify({"error":"PIN requerido"}), 401
+    d = request.json or {}
+    try:
+        msg = music_radio.control(d.get("action",""), d.get("volume"))
+        return jsonify({"ok":True,"message":msg,"radio":music_radio.is_active()})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}), 500
+
+@app.route("/api/music/duck", methods=["POST"])
+def music_duck_api():
+    """El navegador avisa cuando Vesper empieza/termina de hablar para bajar/subir la música."""
+    if not _pin_ok():
+        return jsonify({"error":"PIN requerido"}), 401
+    on = bool((request.json or {}).get("on"))
+    return jsonify({"ducked": music_radio.duck(on)})
 
 @app.route("/spotify/playlists")
 def spotify_playlists():
@@ -1216,14 +1277,18 @@ def get_reminders():
 
 @app.route("/api/notifications", methods=["GET"])
 def get_notifications():
-    notifs = list(_pending_notifications)
-    _pending_notifications.clear()
+    # La tabla notifications es la única fuente. El UPDATE ... RETURNING las marca como
+    # entregadas en un solo paso: aunque haya 2 workers o 2 pestañas, cada aviso sale una vez.
+    notifs = []
     try:
-        rows = db_q("SELECT id,label,type,time FROM notifications WHERE delivered=FALSE ORDER BY created_at", fetch="all") or []
-        for r in rows:
-            notifs.append({"id":r["id"],"label":r["label"],"type":r["type"],"time":str(r["time"])})
-            db_q("UPDATE notifications SET delivered=TRUE WHERE id=%s", (r["id"],))
-    except: pass
+        rows = db_q("""UPDATE notifications SET delivered=TRUE
+                       WHERE delivered=FALSE
+                       RETURNING id, label, type, time, body, created_at""", fetch="all") or []
+        for r in sorted(rows, key=lambda x: x["created_at"]):
+            notifs.append({"id":r["id"],"label":r["label"],"type":r["type"],"time":str(r["time"]),
+                           "body":r.get("body")})
+    except Exception as e:
+        print(f"[NOTIF] {e}")
     return jsonify(notifs)
 
 @app.route("/api/outfit-search")
@@ -1398,7 +1463,6 @@ def webhook_microsoft():
     # Guardar en notificaciones
     db_q("INSERT INTO notifications (label, type, time) VALUES (%s, %s, NOW()::text)",
          (label, f"webhook_{source}"))
-    _pending_notifications.append({"label":label,"type":f"webhook_{source}"})
 
     # Guardar en memoria si hay info nueva de la persona
     from_name = data.get("from_name","")
@@ -1422,7 +1486,10 @@ def webhook_microsoft_verify():
 @app.route("/api/health")
 def health():
     return jsonify({"status":"ok","ts":datetime.now().isoformat(),
-                    "spotify":bool(get_spotify_token())})
+                    "spotify":bool(get_spotify_token()),
+                    "version":"2.2",
+                    "data_db":data_manager._ready,
+                    "data_tools":[t["name"] for t in data_manager.TOOLS]})
 
 # ── Keep-alive ────────────────────────────────────────────────────────────────
 def keep_alive():
@@ -1455,7 +1522,8 @@ def reminder_scheduler():
             now_utc = datetime.now(timezone.utc)
             now_mty = datetime.now(timezone(timedelta(hours=-6)))
             # Recordatorios
-            rows  = db_q("SELECT id, label, trigger_at FROM reminders WHERE status='pending'", fetch="all") or []
+            rows  = db_q("SELECT id, label, trigger_at, prepare FROM reminders WHERE status='pending'", fetch="all") or []
+            prep_by_id = {r["id"]: r.get("prepare") for r in rows}
             fired = []
             for r in rows:
                 rid, label, trigger_at = r["id"], r["label"], str(r["trigger_at"])
@@ -1474,10 +1542,18 @@ def reminder_scheduler():
                         fired.append((rid,label))
 
             for rid, label in fired:
-                db_q("UPDATE reminders SET status='notified' WHERE id=%s", (rid,))
+                # Solo el worker que logre cambiar 'pending' → 'notified' lo dispara
+                claimed = db_q("UPDATE reminders SET status='notified' WHERE id=%s AND status='pending' RETURNING id",
+                               (rid,), fetch="one")
+                if not claimed:
+                    continue
+                if prep_by_id.get(rid):
+                    # Contenido preparado por Vesper: se genera en otro hilo para no frenar el scheduler
+                    threading.Thread(target=deliver_smart_reminder,
+                                     args=(rid, label, prep_by_id[rid]), daemon=True).start()
+                    continue
                 db_q("INSERT INTO notifications (label,type,time) VALUES (%s,%s,%s)",
                           (label,"reminder",now_utc.strftime("%Y-%m-%d %H:%M UTC")))
-                _pending_notifications.append({"id":rid,"label":label,"type":"reminder","time":str(now_utc)})
                 print(f"[REMINDER] {label}")
 
             # Alarmas — ventana de 90 segundos
@@ -1491,17 +1567,93 @@ def reminder_scheduler():
                     diff     = (now_mty - alarm_dt).total_seconds()
                     if 0 <= diff <= 90:
                         label = alarm_label or f"Alarma {alarm_time}"
-                        db_q("UPDATE alarms SET active=FALSE WHERE id=%s", (aid,))
+                        claimed = db_q("UPDATE alarms SET active=FALSE WHERE id=%s AND active=TRUE RETURNING id",
+                                       (aid,), fetch="one")
+                        if not claimed:
+                            continue
                         db_q("INSERT INTO notifications (label,type,time) VALUES (%s,%s,%s)",
                                   (f"⏰ {label}","alarm",alarm_time))
-                        _pending_notifications.append({"id":aid,"label":f"⏰ {label}","type":"alarm","time":alarm_time})
                         print(f"[ALARM] {label}")
                 except Exception as ae:
                     print(f"[ALARM] Error: {ae}")
 
         except Exception as e:
             print(f"[SCHEDULER] Error: {e}")
+        music_radio.tick()   # DJ: rellena la radio si se está acabando
         time.sleep(20)
+
+# ── Recordatorios con contenido preparado ────────────────────────────────────
+REMINDER_TOOLS = {"web_search", "db_describe", "db_find", "db_sql", "financial_action"}
+
+def generate_reminder_content(label, instruction):
+    """Vesper genera el contenido de un recordatorio en el momento en que suena.
+    Puede consultar sus tablas, finanzas e internet (solo lectura)."""
+    session = _session_cache.get(OWNER_NAME) or {"user_type":"owner","name":OWNER_NAME,"db_path":OWNER_DB,
+                                                 "location":get_location()}
+    try:
+        snapshot = build_context_snapshot(session, {"mode":"text"}, db_q=db_q, get_weather=get_weather,
+                                          weather_summary=weather_summary, spotify_headers=spotify_headers)
+    except Exception as e:
+        print(f"[REMINDER] snapshot: {e}")
+        snapshot = f"Hora local: {now_local().strftime('%Y-%m-%d %H:%M')}"
+    memories = get_relevant_memories(instruction)
+    system = (
+        "Eres VESPER, asistente personal del Sr. Ozhelli. Un recordatorio que él programó acaba de sonar y "
+        "debes entregarle el contenido que te dejaste encargado.\n\n"
+        f"{snapshot}\n"
+        f"\nLO QUE SÉ SOBRE EL SEÑOR:{memories}\n"
+        f"{preferences.prompt_block(db_q)}"
+        f"{data_manager.prompt_block()}\n"
+        "REGLAS:\n"
+        "- Usa las tools si necesitas datos reales (sus tablas, finanzas, internet). Son de solo lectura.\n"
+        "- Entrega el contenido directo, listo para usarse: cantidades exactas, horarios, pasos. Markdown sencillo "
+        "(negritas, listas, tablas cortas). Máximo ~200 palabras.\n"
+        "- No saludes largo ni cierres con preguntas; a lo mucho una sugerencia final breve.\n"
+        "- Llama al dueño 'señor'. Nunca reveles que eres Claude.\n"
+    )
+    tools = [t for t in get_all_tools() if t["name"] in REMINDER_TOOLS]
+    messages = [{"role":"user","content":f"Recordatorio: {label}\nEncargo: {instruction}"}]
+    text = ""
+    loop = asyncio.new_event_loop()
+    try:
+        for _ in range(6):
+            resp = client.messages.create(model="claude-sonnet-4-5", max_tokens=1200,
+                                          system=system, tools=tools, messages=messages)
+            parts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
+            if parts: text = " ".join(parts)
+            if resp.stop_reason != "tool_use": break
+            uses = [b for b in resp.content if b.type == "tool_use"]
+            messages.append({"role":"assistant","content":resp.content})
+            results = []
+            for u in uses:
+                if u.name not in REMINDER_TOOLS or (u.name == "financial_action" and
+                                                    (u.input or {}).get("action") != "consultar"):
+                    out = "No disponible en recordatorios (solo lectura)."
+                else:
+                    out = loop.run_until_complete(dispatch_action(u.name, u.input, OWNER_DB))
+                    try:
+                        d = json.loads(out)
+                        if isinstance(d, dict) and "text" in d: out = d["text"]
+                    except Exception: pass
+                results.append({"type":"tool_result","tool_use_id":u.id,"content":str(out)[:6000]})
+            messages.append({"role":"user","content":results})
+    finally:
+        loop.close()
+    return text.strip()
+
+def deliver_smart_reminder(rid, label, instruction):
+    body = ""
+    try:
+        body = generate_reminder_content(label, instruction)
+    except Exception as e:
+        print(f"[REMINDER] generación falló ({rid}): {e}")
+    if not body:
+        body = f"No pude preparar el contenido a tiempo. Lo que tenía encargado: {instruction}"
+    db_q("INSERT INTO notifications (label,type,time,body) VALUES (%s,%s,%s,%s)",
+         (label, "reminder", now_local().strftime("%Y-%m-%d %H:%M"), body))
+    # Queda en el historial para que el señor pueda preguntar sobre él después
+    save_message("assistant", f"⏰ Recordatorio: {label}\n\n{body}", OWNER_DB, intent="reminder")
+    print(f"[REMINDER] {label} (con contenido, {len(body)} caracteres)")
 
 def get_relevant_memories(context_hint=""):
     """Recupera memorias relevantes para el contexto actual."""
@@ -1569,6 +1721,8 @@ Responde ÚNICAMENTE con JSON válido, sin texto extra:
   Una señal por criterio. Categorías: compras, comida, musica, comunicacion, trabajo, rutina, general.
   Si el criterio ya existe en esta lista, REUTILIZA EXACTAMENTE su clave:
 {known_txt}
+- NO guardes como memoria propuestas de tablas, esquemas SQL, "funciones por implementar" ni registros que ya
+  se guardaron en la base de datos con las tools db_* (contactos, medidas, etc.).
 - Si no hay nada, usa listas vacías. No inventes.""",
             messages=[{"role": "user", "content":
                 f"CONTEXTO PREVIO (solo referencia, no extraigas señales de aquí):\n{context_txt}\n\n"

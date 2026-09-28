@@ -444,6 +444,26 @@ body.mode-voice .mic-sm { display: none; }
 .outfit-tile:hover img { transform: scale(1.04); }
 .outfit-tile:hover { border-color: var(--cyan); }
 .card-empty { font-size:13px; color:var(--text2); padding:10px 0; }
+/* Tarjeta web: imágenes + fuentes */
+.web-strip { display:flex; gap:8px; overflow-x:auto; scroll-snap-type:x mandatory; -webkit-overflow-scrolling:touch;
+  padding-bottom:4px; scrollbar-width:thin; }
+.web-tile { position:relative; flex:0 0 auto; width:138px; aspect-ratio:4/3; border-radius:10px; overflow:hidden;
+  border:1px solid var(--border); background:var(--bg3); padding:0; cursor:pointer; scroll-snap-align:start; }
+.web-tile img { width:100%; height:100%; object-fit:cover; display:block; transition:transform .25s; }
+.web-tile:hover { border-color:var(--cyan); } .web-tile:hover img { transform:scale(1.04); }
+.web-tile-src { position:absolute; left:0; right:0; bottom:0; padding:12px 7px 4px; font-size:10px; color:#fff; text-align:left;
+  background:linear-gradient(transparent, rgba(3,7,15,.85)); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.web-sources { list-style:none; margin:0 0 6px; padding:0; }
+.web-sources li { border-bottom:1px solid rgba(26,58,92,.5); } .web-sources li:last-child { border-bottom:0; }
+.web-sources a { display:flex; align-items:center; gap:10px; padding:7px 2px; color:var(--text); text-decoration:none; min-width:0; }
+.web-sources a:hover .web-src-title { color:var(--cyan); }
+.web-sources .fav { width:16px; height:16px; border-radius:3px; flex:none; }
+.web-src-text { display:flex; flex-direction:column; min-width:0; flex:1; }
+.web-src-title { font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.web-src-dom { font-size:11px; color:var(--text2); }
+.web-ext { color:var(--text2); font-size:12px; flex:none; }
+a.card-btn { text-decoration:none; display:inline-flex; align-items:center; }
+.lightbox small { color:var(--text2); }
 /* Tabla de datos (base de datos dinámica) */
 .dt-count { font-size:11px; color:var(--text2); margin-left:6px; letter-spacing:0; text-transform:none; font-family:inherit; }
 .dt-wrap { overflow-x:auto; margin:0 -4px; -webkit-overflow-scrolling:touch; }
@@ -1052,6 +1072,10 @@ window.send = async function send(){
         setTimeout(()=>window.open("/spotify/login","_blank","width=500,height=700"),500);
       } else if(ma.action==="play_song"){
         addMsg("assistant","▶️ Reproduciendo: **"+ma.name+"** — "+ma.artist, {silentVoice:true});
+      } else if(ma.action==="spotify_no_device"){
+        addMsg("assistant","📱 Abra Spotify en su celular o compu (solo abrirlo) y vuelva a pedírmelo, señor.", {silentVoice:true});
+      } else if(ma.action==="radio"){
+        radioOn = true;
       } else if(ma.action==="create_playlist"){
         addMsg("assistant","✅ Playlist \""+ma.playlist_name+"\" creada con "+ma.total+" canciones.", {silentVoice:true});
       }
@@ -1204,9 +1228,9 @@ function speakNext(){
     voices.find(v => v.lang.startsWith("es") && !v.lang.includes("ES")) ||
     voices.find(v => v.lang.startsWith("es"));
   if(spanish) u.voice = spanish;
-  u.onstart = () => setAnimState("speaking");
-  u.onend   = () => { _isSpeaking = false; setAnimState("idle"); speakNext(); };
-  u.onerror = () => { _isSpeaking = false; setAnimState("idle"); speakNext(); };
+  u.onstart = () => { setAnimState("speaking"); musicDuck(true); };
+  u.onend   = () => { _isSpeaking = false; setAnimState("idle"); if(!_speakQueue.length) musicDuck(false); speakNext(); };
+  u.onerror = () => { _isSpeaking = false; setAnimState("idle"); if(!_speakQueue.length) musicDuck(false); speakNext(); };
   setTimeout(() => {
     try {
       window.speechSynthesis.speak(u);
@@ -1253,6 +1277,7 @@ async function pollSpotify(){
     if(r.status === 204){ $("track-name").textContent = "Sin reproducción activa"; _lastTrackUri = null; return; }
     const d = await r.json();
     if(!d || !d.name) return;
+    radioOn = !!d.radio;
     const newUri = d.uri || d.name;
     if(newUri !== _lastTrackUri){
       _lastTrackUri = newUri;
@@ -1278,22 +1303,34 @@ window.openSpotifyLogin = function(){
 };
 
 // ── Notificaciones (recordatorios y alarmas) ─────────────────────────────────
-function showNotification(label){
+function showNotification(n){
+  if(typeof n === "string") n = {label: n};
+  const label = n.label || "Recordatorio";
   toast(label, "⏰ RECORDATORIO");
-  addMsg("assistant", "⏰ Recordatorio: " + label, {silentVoice:true});
-  showReply("Señor, recordatorio: " + label);
-  speakText("Señor, recordatorio: " + label);
+  if(n.body){
+    // Recordatorio con contenido preparado por Vesper
+    const full = "⏰ **" + label + "**\n\n" + n.body;
+    addMsg("assistant", full, {silentVoice:true});
+    showReply(full);
+    speakText(mode === "voice" ? "Señor, recordatorio: " + label + ". " + n.body
+                               : "Señor, recordatorio: " + label + ". Le dejé el detalle en pantalla.");
+  } else {
+    addMsg("assistant", "⏰ Recordatorio: " + label, {silentVoice:true});
+    showReply("Señor, recordatorio: " + label);
+    speakText("Señor, recordatorio: " + label);
+  }
 }
 async function pollNotifications(){
-  try{ const d = await (await fetch("/api/notifications")).json(); if(d && d.length) d.forEach(n => showNotification(n.label)); }
+  try{ const d = await (await fetch("/api/notifications")).json(); if(d && d.length) d.forEach(showNotification); }
   catch(e){}
 }
+document.addEventListener("visibilitychange", () => { if(!document.hidden && _pollingStarted) pollNotifications(); });
 
 let _pollingStarted = false;
 function startPolling(){
   if(_pollingStarted) return;
   _pollingStarted = true;
-  setInterval(pollNotifications, 45000);
+  setInterval(pollNotifications, 20000);
   setInterval(pollSpotify, 4000);
   pollSpotify();
 }
@@ -1306,6 +1343,7 @@ function renderCards(cards){
     if(c.type === "finance") wrap.appendChild(financeCard(c));
     else if(c.type === "outfits") wrap.appendChild(outfitCard(c));
     else if(c.type === "data_table") wrap.appendChild(dataCard(c));
+    else if(c.type === "web") { const w = webCard(c); if(w) wrap.appendChild(w); }
   });
   return wrap;
 }
@@ -1370,6 +1408,68 @@ function financeCard(data){
   draw(data);
   return el;
 }
+// ── Radio: bajar el volumen de la música mientras Vesper habla ──
+let radioOn = false, _ducked = false;
+const pinHeaders = () => ({"Content-Type":"application/json", "X-Vesper-Pin": store.get("vesper_pin") || ""});
+function musicDuck(on){
+  if(on === _ducked || (on && !radioOn)) return;
+  _ducked = on;
+  fetch("/api/music/duck", {method:"POST", headers:pinHeaders(), body:JSON.stringify({on})}).catch(()=>{});
+}
+// ── Tarjeta web: imágenes y fuentes con enlace ──
+const safeUrl = u => (typeof u === "string" && /^https?:\/\//i.test(u)) ? u : null;
+function webCard(data){
+  const imgs = (data.images || []).filter(i => safeUrl(i.thumb) && i.thumb.startsWith("https://"));
+  const srcs = (data.sources || []).filter(x => safeUrl(x.url));
+  if(!imgs.length && !srcs.length) return null;
+  const el = document.createElement("div");
+  el.className = "ui-card web-card";
+  let showAll = false;
+  const draw = () => {
+    const list = showAll ? srcs : srcs.slice(0, 3);
+    el.innerHTML = `
+      ${imgs.length ? `<div class="web-strip" role="list">${imgs.map((im, i) => `
+        <button class="web-tile" data-i="${i}" role="listitem" aria-label="${esc(im.title || im.source || "imagen")}">
+          <img src="${esc(im.thumb)}" alt="${esc(im.title || "")}" loading="lazy" referrerpolicy="no-referrer"
+               onerror="this.parentElement.remove()">
+          <span class="web-tile-src">${esc(im.source || "")}</span>
+        </button>`).join("")}</div>` : ""}
+      ${srcs.length ? `<div class="card-head" style="margin:${imgs.length ? "12px" : "0"} 0 6px"><span class="card-title">Fuentes</span></div>
+      <ol class="web-sources">${list.map((x) => `
+        <li><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">
+          <img class="fav" src="https://www.google.com/s2/favicons?domain=${encodeURIComponent(x.domain || "")}&sz=32" alt="" loading="lazy"
+               referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">
+          <span class="web-src-text"><span class="web-src-title">${esc(x.title || x.domain)}</span>
+          <span class="web-src-dom">${esc(x.domain || "")}</span></span><span class="web-ext" aria-hidden="true">↗</span></a></li>`).join("")}</ol>
+      ${srcs.length > 3 ? `<button class="card-btn" data-act="more">${showAll ? "Ver menos" : "Ver " + (srcs.length - 3) + " más"}</button>` : ""}` : ""}`;
+    el.querySelectorAll(".web-tile").forEach(t => t.onclick = () => openImageViewer(imgs[+t.dataset.i]));
+  };
+  el.addEventListener("click", e => {
+    if(e.target.closest("[data-act='more']")){ showAll = !showAll; draw(); }
+  });
+  draw();
+  // Si todas las imágenes fallaron y no hay fuentes, la tarjeta desaparece
+  setTimeout(() => { const st = el.querySelector(".web-strip"); if(st && !st.children.length){ st.remove(); if(!srcs.length) el.remove(); } }, 8000);
+  return el;
+}
+function openImageViewer(im){
+  const link = safeUrl(im.link);
+  const lb = document.createElement("div");
+  lb.className = "lightbox";
+  lb.innerHTML = `<img src="${esc(im.img || im.thumb)}" alt="${esc(im.title || "")}" referrerpolicy="no-referrer"
+      onerror="if(this.src!=='${esc(im.thumb)}') this.src='${esc(im.thumb)}'">
+    <div class="lb-title">${esc(im.title || "")}${im.source ? `<br><small>${esc(im.source)}</small>` : ""}</div>
+    <div class="card-actions">
+      ${link ? `<a class="card-btn" href="${esc(link)}" target="_blank" rel="noopener noreferrer">Abrir fuente ↗</a>` : ""}
+      <button class="card-btn" data-a="close">Cerrar</button>
+    </div>`;
+  const close = () => { lb.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = e => { if(e.key === "Escape") close(); };
+  lb.onclick = e => { if(e.target === lb || e.target.closest("[data-a='close']")) close(); };
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(lb);
+}
+
 // ── Tarjeta de tabla (base de datos dinámica) ──
 const DT_HIDDEN = ["creado_en","actualizado_en"];
 const colLabel = c => c === "count" ? "registros" : c
