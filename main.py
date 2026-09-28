@@ -22,8 +22,13 @@ from anthropic import Anthropic
 from flask import Flask, request, jsonify, send_from_directory, redirect, Response
 from flask_cors import CORS
 from alarms import AlarmManager
+from attachments import build_attachment_blocks
+from context_snapshot import build_context_snapshot, now_local
+import preferences
 
 app = Flask(__name__, static_folder="static")
+# Adjuntos: hasta 5 archivos de 20 MB en base64 (~1.37x)
+app.config["MAX_CONTENT_LENGTH"] = 140 * 1024 * 1024
 CORS(app)
 
 # ── PostgreSQL ───────────────────────────────────────────────────────────────
@@ -235,6 +240,11 @@ def init_owner_db():
             db_q("INSERT INTO memories (category,key,value,source) VALUES (%s,%s,%s,'seed') ON CONFLICT (category,key) DO NOTHING",
                  (cat,key,val))
         except: pass
+
+    try:
+        preferences.init_table(db_q)
+    except Exception as e:
+        print(f"[DB] preference_candidates: {e}")
 
     load_spotify_tokens_from_db()
     print("[DB] Inicializado")
@@ -472,12 +482,17 @@ BASE_TOOLS = [
 ]
 
 def get_all_tools():
-    """Tools base."""
-    return BASE_TOOLS
+    """Tools base + confirmación de preferencias aprendidas."""
+    return BASE_TOOLS + [preferences.CONFIRM_TOOL]
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 async def dispatch_action(tool_name, tool_input, db_path):
     print(f"  [DISPATCH] {tool_name}")
+
+    # ── Preferencias aprendidas ───────────────────────────────────────────────
+    if tool_name == "confirm_preference":
+        return preferences.confirm(db_q, tool_input.get("key",""),
+                                   bool(tool_input.get("accepted")), tool_input.get("value"))
 
     # ── Cámaras públicas ───────────────────────────────────────────────────────
     if tool_name == "view_camera":
@@ -664,7 +679,7 @@ async def dispatch_action(tool_name, tool_input, db_path):
 
 # ── Identificacion ────────────────────────────────────────────────────────────
 def get_greeting():
-    h = datetime.now().hour
+    h = now_local().hour
     if 5<=h<12: return "Buenos días"
     elif 12<=h<19: return "Buenas tardes"
     else: return "Buenas noches"
@@ -701,34 +716,43 @@ def identify_user(text, pin=None):
             "db_path":GUESTS_DB,"permissions":"limited","visit_count":vc}
 
 # ── Orquestador ───────────────────────────────────────────────────────────────
-async def orchestrate(user_prompt, session, image_base64=None, image_type="image/jpeg"):
-    db_path  = session["db_path"]
-    username = session["name"]
-    weather  = session.get("weather",{})
-    location = session.get("location",{})
-    now      = datetime.now().strftime("%A %d de %B %Y, %H:%M")
-    is_owner = session["user_type"] == "owner"
-    reminders= load_pending_reminders() if is_owner else []
-    people   = load_known_people() if is_owner else []
-    rem_str  = "\n".join([f"  - {r['label']} {r['at']}" for r in reminders]) if reminders else "  (ninguno)"
-    ppl_str  = "\n".join([f"  - {p['name']} ({p['relation']}): {p['notes']}" for p in people]) if people else "  (ninguna)"
-    spotify_ok = "conectado" if get_spotify_token() else "NO conectado"
-    now_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    now_mty_str = datetime.now(timezone(timedelta(hours=-6))).strftime("%H:%M")
+def _history_bucket(db_path):
+    return OWNER_DB if db_path == OWNER_DB else GUESTS_DB
 
-    # Config financiera para contexto
+async def orchestrate(user_prompt, session, image_base64=None, image_type="image/jpeg",
+                      attachments=None, client_ctx=None):
+    db_path  = session["db_path"]
+    bucket   = _history_bucket(db_path)
+    is_owner = session["user_type"] == "owner"
+    client_ctx = client_ctx or {}
+    mode     = "voice" if client_ctx.get("mode") == "voice" else "text"
+
+    # Compatibilidad: imagen suelta del frontend viejo → lista de adjuntos
+    attachments = list(attachments or [])
+    if image_base64:
+        attachments.insert(0, {"name": "imagen", "media_type": image_type, "data": image_base64})
+
+    # 1) Foto de contexto (temporal, espacial, personal inmediato, ambiental)
+    snapshot = build_context_snapshot(
+        session, client_ctx, db_q=db_q, get_weather=get_weather,
+        weather_summary=weather_summary, spotify_headers=spotify_headers)
+
+    now_l = now_local()
+    people  = load_known_people() if is_owner else []
+    ppl_str = "\n".join([f"  - {p['name']} ({p['relation']}): {p['notes']}" for p in people]) if people else "  (ninguna)"
+
     cfg_str = ""
     if is_owner:
         try:
             cfg = get_financial_config()
-            cfg_str = f"Presupuesto mensual: ${cfg.get('monthly_budget',28051):,.0f} MXN. Deuda auto: ${cfg.get('auto_debt',300000):,.0f} MXN.\n"
+            cfg_str = f"Finanzas: presupuesto ${cfg.get('monthly_budget',28051):,.0f} MXN, deuda auto ${cfg.get('auto_debt',300000):,.0f} MXN.\n"
         except: pass
 
     if is_owner:
         behavior = (
             "- Usa tools para todas las acciones.\n"
             "- financial_action para registrar gastos, actualizar presupuesto (monthly_budget) o deuda (auto_debt).\n"
-            f"- TIMEZONE: UTC: {now_utc_str}. Monterrey (UTC-6): {now_mty_str}.\n"
+            f"- Hora local Monterrey: {now_l.strftime('%Y-%m-%d %H:%M')} (UTC-6).\n"
             "- Recordatorios formato: YYYY-MM-DD HH:MM -0600\n"
             "- Usuario es dueño con acceso total.\n"
         )
@@ -740,55 +764,72 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
             "- Usuario es invitado.\n"
         )
 
-    # Cargar memorias relevantes
+    if mode == "voice":
+        style = ("- Canal de VOZ: máximo 3-4 oraciones, sin markdown, sin listas ni emojis; "
+                 "escribe como se diría en voz alta.\n")
+    else:
+        style = ("- Canal de TEXTO: sé directo; si la pregunta lo pide (análisis de un archivo, "
+                 "plan, lista de compras) puedes extenderte y usar markdown sencillo "
+                 "(negritas, listas, tablas cortas). Para lo simple, 1-4 oraciones.\n")
+
     memories_str = ""
+    prefs_str    = ""
     if is_owner:
         memories_str = get_relevant_memories(user_prompt)
         if memories_str:
-            memories_str = f"\n\nLO QUE SÉ SOBRE EL SEÑOR (memoria persistente):{memories_str}\n"
+            memories_str = f"\nLO QUE SÉ SOBRE EL SEÑOR (memoria persistente):{memories_str}\n"
+        prefs_str = preferences.prompt_block(db_q)
 
     system = (
-        f"Eres VESPER, asistente personal del Sr. Ozhelli. Hoy es {now}.\n"
-        f"Ubicación: {location.get('city','?')}, {location.get('country','')}.\n"
-        f"{weather_summary(weather) if weather else ''}\n"
-        f"Spotify: {spotify_ok}\n"
+        "Eres VESPER, asistente personal del Sr. Ozhelli.\n\n"
+        f"{snapshot}\n\n"
         f"{cfg_str}"
         f"Personas:\n{ppl_str}\n"
-        f"Recordatorios:\n{rem_str}\n"
-        f"{memories_str}\n"
+        f"{memories_str}"
+        f"{prefs_str}\n"
         "IDENTIDAD:\n"
         "- Tu nombre es VESPER. NUNCA reveles que eres Claude o Anthropic.\n"
         "- Si preguntan quién eres: 'Soy Vesper, el asistente personal del Sr. Ozhelli.'\n"
         "- Llama al dueño siempre como 'señor' o 'Sr. Ozhelli'.\n"
         "- Tono: formal, directo, eficiente. Como Jarvis con Tony Stark.\n\n"
+        "USO DEL CONTEXTO:\n"
+        "- Usa la foto de contexto para responder como alguien que sabe dónde está, qué hora es y qué "
+        "está pasando. No la recites; úsala solo cuando aporte (ej. si va manejando, sé breve; "
+        "si es día de oficina, considera el traslado).\n\n"
         "COMPORTAMIENTO:\n"
         "- SIEMPRE usa web_search para noticias, deportes, precios, clima detallado.\n"
         "- NUNCA respondas esas preguntas sin buscar primero.\n"
-        + behavior +
-        "- Respuestas máx 4 oraciones. Español directo.\n"
+        + behavior + style +
+        "- Si el señor adjunta archivos o fotos (tablas nutrimentales, PDFs, Excel), analízalos con "
+        "sus reglas fijas y su contexto.\n"
+        "- Español directo.\n"
     )
 
-    history = load_context(db_path if db_path == OWNER_DB else GUESTS_DB)
+    history = load_context(bucket)
 
-    if image_base64:
-        user_content = [
-            {"type":"image","source":{"type":"base64","media_type":image_type,"data":image_base64}},
-            {"type":"text","text":user_prompt if user_prompt else "¿Qué ves en esta imagen?"}
-        ]
-        save_message("user", f"[imagen] {user_prompt}", db_path if db_path else GUESTS_DB)
+    # 2) Contenido del mensaje: texto + adjuntos
+    blocks, labels, attach_errors = build_attachment_blocks(attachments)
+    prompt_text = user_prompt or ("Analiza lo que te adjunto." if blocks else "")
+    if attach_errors:
+        prompt_text += "\n\n[Avisos del sistema sobre adjuntos: " + " ".join(attach_errors) + \
+                       " Menciónalo brevemente al señor.]"
+    if blocks:
+        user_content = blocks + [{"type":"text","text":prompt_text}]
+        saved_text = f"[adjuntos: {', '.join(labels)}] {user_prompt}".strip()
     else:
-        user_content = user_prompt
-        save_message("user", user_prompt, db_path if db_path else GUESTS_DB)
+        user_content = prompt_text
+        saved_text = user_prompt if not attach_errors else f"{user_prompt} [adjuntos no leídos]"
+    save_message("user", saved_text or "(mensaje vacío)", bucket)
 
     history.append({"role":"user","content":user_content})
     messages       = history
     final_response = ""
     music_action   = None
 
-    while True:
+    for _ in range(8):   # tope de vueltas de herramientas
         tools_to_use = get_all_tools() if is_owner else []
         response = client.messages.create(
-            model="claude-sonnet-4-5", max_tokens=1024,
+            model="claude-sonnet-4-5", max_tokens=2048 if mode == "text" else 700,
             system=system, tools=tools_to_use, messages=messages)
         text_parts = [b.text for b in response.content if hasattr(b,"text") and b.type=="text"]
         if text_parts: final_response = " ".join(text_parts)
@@ -805,14 +846,13 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
         messages.append({"role":"user","content":tool_results})
 
     if final_response:
-        save_message("assistant", final_response, db_path if db_path else GUESTS_DB)
-        # Extraer y guardar memorias en background (no bloquea la respuesta)
-        if is_owner and len(messages) > 2:
-            convo_text = " | ".join([
-                f"{m['role']}: {m['content'] if isinstance(m['content'],str) else str(m['content'])[:200]}"
-                for m in messages[-6:] if isinstance(m.get('content'), (str, list))
-            ])
-            asyncio.ensure_future(extract_and_save_memories(convo_text, session))
+        save_message("assistant", final_response, bucket)
+        # Memoria + señales de preferencia en segundo plano (no bloquea la respuesta)
+        if is_owner:
+            recent = [m for m in load_context(bucket)[-6:]]
+            threading.Thread(target=extract_and_save_memories,
+                             args=(recent, saved_text, final_response, session),
+                             daemon=True).start()
     return final_response or "Listo.", music_action
 
 # ── Spotify OAuth ─────────────────────────────────────────────────────────────
@@ -968,8 +1008,12 @@ def chat():
     user_name    = data.get("user", OWNER_NAME)
     image_base64 = data.get("image_base64")
     image_type   = data.get("image_type","image/jpeg")
+    attachments  = data.get("attachments") or []
+    client_ctx   = data.get("client_context") or {}
+    if isinstance(client_ctx, dict):
+        client_ctx["mode"] = data.get("mode") or client_ctx.get("mode")
 
-    if not user_message and not image_base64:
+    if not user_message and not image_base64 and not attachments:
         return jsonify({"error":"Mensaje vacío"}), 400
 
     session = _session_cache.get(user_name)
@@ -981,12 +1025,43 @@ def chat():
     try:
         loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
         resp, music_action = loop.run_until_complete(
-            orchestrate(user_message, session, image_base64, image_type))
+            orchestrate(user_message, session, image_base64, image_type,
+                        attachments=attachments, client_ctx=client_ctx))
         loop.close()
         return jsonify({"response":resp,"user":session["name"],"music_action":music_action})
     except Exception as e:
         print(f"[ERROR] {e}"); traceback.print_exc()
         return jsonify({"error":str(e)}), 500
+
+def _pin_ok():
+    """Si hay OWNER_PIN configurado, exige el PIN en el header X-Vesper-Pin."""
+    return (not OWNER_PIN) or request.headers.get("X-Vesper-Pin","") == OWNER_PIN
+
+@app.route("/api/history", methods=["GET"])
+def get_history():
+    """Últimos mensajes del dueño para pintar el modo texto al abrir la app."""
+    if not _pin_ok():
+        return jsonify({"error":"PIN requerido"}), 401
+    try:
+        limit = max(1, min(int(request.args.get("limit", 40)), 100))
+    except ValueError:
+        limit = 40
+    rows = db_q("""SELECT role, content, created_at FROM context_history
+                   WHERE user_type=%s ORDER BY created_at DESC LIMIT %s""",
+                (OWNER_DB, limit), fetch="all") or []
+    return jsonify([{"role":r["role"],"content":r["content"],"at":r["created_at"].isoformat()}
+                    for r in reversed(list(rows))])
+
+@app.route("/api/preferences", methods=["GET"])
+def get_preferences():
+    """Para revisar qué está aprendiendo Vesper (observando, por confirmar, confirmadas)."""
+    if not _pin_ok():
+        return jsonify({"error":"PIN requerido"}), 401
+    return jsonify(preferences.list_all(db_q))
+
+@app.errorhandler(413)
+def too_large(_e):
+    return jsonify({"error":"Los archivos son demasiado grandes para enviarse juntos."}), 413
 
 @app.route("/api/reminders", methods=["GET"])
 def get_reminders():
@@ -1281,9 +1356,11 @@ def reminder_scheduler():
 def get_relevant_memories(context_hint=""):
     """Recupera memorias relevantes para el contexto actual."""
     try:
-        rows     = db_q("SELECT category, key, value, updated_at FROM memories ORDER BY updated_at DESC LIMIT 40", fetch="all") or []
+        rows     = db_q("""SELECT category, key, value, updated_at FROM memories
+                           WHERE NOT (category='preferencias' AND source='confirmed')
+                           ORDER BY updated_at DESC LIMIT 40""", fetch="all") or []
         patterns = db_q("SELECT pattern_type, description, occurrences FROM patterns ORDER BY last_seen DESC LIMIT 10", fetch="all") or []
-        today    = datetime.now().strftime("%Y-%m-%d")
+        today    = now_local().strftime("%Y-%m-%d")
         sum_row  = db_q("SELECT summary FROM daily_summaries WHERE date=%s", (today,), fetch="one")
 
         mem_str = ""
@@ -1307,40 +1384,49 @@ def get_relevant_memories(context_hint=""):
         print(f"[MEMORY] Error leyendo: {e}")
         return ""
 
-async def extract_and_save_memories(conversation_text, session):
-    """Extrae información relevante de la conversación y la guarda en memoria."""
+def extract_and_save_memories(recent_messages, user_text, assistant_text, session):
+    """
+    Corre en un hilo aparte después de cada respuesta. Extrae:
+      - memorias: hechos nuevos del señor (se guardan directo)
+      - señales de preferencia: gustos/criterios que se CUENTAN (ver preferences.py)
+    Las señales se sacan SOLO del último intercambio para no contar dos veces lo mismo.
+    """
     if session.get("user_type") != "owner":
         return
     try:
+        def fmt(m):
+            c = m.get("content")
+            return f"{m.get('role')}: {c if isinstance(c,str) else str(c)[:200]}"
+        context_txt = "\n".join(fmt(m) for m in recent_messages[:-2])[-1500:]
+        known = preferences.known_candidate_keys(db_q)
+        known_txt = "\n".join(f"  - {k}" for k in known) if known else "  (ninguna aún)"
+
         result = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=800,
-            system="""Eres un extractor de memoria para un asistente personal llamado Vesper.
-Analiza la conversación y extrae SOLO hechos nuevos o actualizaciones importantes sobre el usuario.
-Responde ÚNICAMENTE con JSON válido, sin texto extra.
-Formato:
-{
-  "memories": [
-    {"category": "categoria", "key": "clave_snake_case", "value": "valor"},
-    ...
-  ],
-  "patterns": [
-    {"type": "tipo", "description": "descripción del patrón detectado"},
-    ...
-  ]
-}
-Categorías válidas: personal, trabajo, finanzas, estilo, deportes, proyectos, musica, salud, relaciones, preferencias
-Si no hay nada nuevo relevante, responde: {"memories": [], "patterns": []}
-NO extraigas información ya conocida o trivial.""",
+            system=f"""Eres el extractor de memoria de Vesper, asistente personal del Sr. Ozhelli.
+Responde ÚNICAMENTE con JSON válido, sin texto extra:
+{{
+  "memories": [{{"category": "...", "key": "clave_snake_case", "value": "..."}}],
+  "patterns": [{{"type": "...", "description": "..."}}],
+  "preference_signals": [{{"category": "...", "key": "clave_snake_case", "value": "Prefiere ...", "evidence": "qué pasó"}}]
+}}
+- memories: SOLO hechos nuevos e importantes (datos personales, trabajo, proyectos, salud...).
+  Categorías: personal, trabajo, finanzas, estilo, deportes, proyectos, musica, salud, relaciones.
+  NO pongas gustos ni criterios aquí.
+- preference_signals: cuando en el ÚLTIMO INTERCAMBIO el señor muestra un gusto o criterio con una
+  decisión concreta (rechaza/elige un producto por una razón, pide algo de cierta forma, corrige a Vesper).
+  Una señal por criterio. Categorías: compras, comida, musica, comunicacion, trabajo, rutina, general.
+  Si el criterio ya existe en esta lista, REUTILIZA EXACTAMENTE su clave:
+{known_txt}
+- Si no hay nada, usa listas vacías. No inventes.""",
             messages=[{"role": "user", "content":
-                f"Extrae información nueva de esta conversación:\n\n{conversation_text[-2000:]}"}]
+                f"CONTEXTO PREVIO (solo referencia, no extraigas señales de aquí):\n{context_txt}\n\n"
+                f"ÚLTIMO INTERCAMBIO:\nseñor: {user_text[:1500]}\nvesper: {assistant_text[:1500]}"}]
         )
         raw  = result.content[0].text.strip()
         raw  = raw.replace("```json","").replace("```","").strip()
         data = json.loads(raw)
-
-        if not data.get("memories") and not data.get("patterns"):
-            return
 
         saved = 0
         for mem in data.get("memories", []):
@@ -1356,6 +1442,11 @@ NO extraigas información ya conocida o trivial.""",
                     db_q("UPDATE patterns SET occurrences=occurrences+1, last_seen=NOW() WHERE id=%s", (existing["id"],))
                 else:
                     db_q("INSERT INTO patterns (pattern_type, description) VALUES (%s,%s)", (pat["type"], pat["description"]))
+        for sig in data.get("preference_signals", []):
+            if sig.get("key") and sig.get("value"):
+                st = preferences.record_signal(db_q, sig.get("category","general"), sig["key"],
+                                               str(sig["value"]), str(sig.get("evidence","")))
+                print(f"[PREFS] señal {sig['key']} → {st}")
         if saved > 0:
             print(f"[MEMORY] {saved} memorias guardadas")
     except Exception as e:
