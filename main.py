@@ -430,7 +430,7 @@ def spotify_create_playlist(name, track_uris):
 def ai_generate_playlist(mood, count=15):
     safe_count = min(count, 50)
     result = client.messages.create(
-        model="claude-sonnet-4-5", max_tokens=1000,
+        model="claude-haiku-4-5", max_tokens=1000,
         system="Eres un DJ experto. Genera playlists con canciones reales y populares. Responde SOLO JSON valido, sin texto extra, sin backticks.",
         messages=[{"role":"user","content":
             f"Genera exactamente {safe_count} canciones para mood: '{mood}'. "
@@ -445,7 +445,7 @@ def ai_generate_playlist(mood, count=15):
 
 def ai_song_for_weather(weather):
     result = client.messages.create(
-        model="claude-sonnet-4-5", max_tokens=200,
+        model="claude-haiku-4-5", max_tokens=200,
         system="DJ que elige musica perfecta para el clima. Solo JSON.",
         messages=[{"role":"user","content":
             f"Clima: {weather_summary(weather)}. "
@@ -899,7 +899,7 @@ async def orchestrate(user_prompt, session, image_base64=None, image_type="image
     for _ in range(12):   # tope de vueltas de herramientas (db_* puede encadenar varias)
         tools_to_use = get_all_tools() if is_owner else []
         response = client.messages.create(
-            model="claude-sonnet-4-5", max_tokens=2048 if mode == "text" else 700,
+            model="claude-haiku-4-5", max_tokens=2048 if mode == "text" else 700,
             system=system, tools=tools_to_use, messages=messages)
         text_parts = [b.text for b in response.content if hasattr(b,"text") and b.type=="text"]
         if text_parts: final_response = " ".join(text_parts)
@@ -1617,7 +1617,7 @@ def generate_reminder_content(label, instruction):
     loop = asyncio.new_event_loop()
     try:
         for _ in range(6):
-            resp = client.messages.create(model="claude-sonnet-4-5", max_tokens=1200,
+            resp = client.messages.create(model="claude-haiku-4-5", max_tokens=1200,
                                           system=system, tools=tools, messages=messages)
             parts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
             if parts: text = " ".join(parts)
